@@ -1,0 +1,55 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --font-display: 'Plus Jakarta Sans', system-ui, sans-serif;
+    --font-sans: 'Public Sans', system-ui, sans-serif;
+    --font-mono: 'IBM Plex Mono', ui-monospace, monospace;
+    --font-memo: 'Times New Roman', Times, Georgia, serif;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    background-color: #f8fafc;
+    color: #0f172a;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  h1, h2, h3, h4, .font-display {
+    font-family: var(--font-display);
+  }
+
+  .font-mono-tabular {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .font-memo {
+    font-family: var(--font-memo);
+  }
+}
+
+/* Official IC Memo Preview Sheet Styling (matches Word .docx output) */
+.ic-memo-sheet {
+  font-family: 'Times New Roman', Times, Georgia, serif;
+  color: #000000;
+  background-color: #ffffff;
+  line-height: 1.3;
+  font-size: 10pt;
+}
+
+.ic-memo-sheet table {
+  border-collapse: collapse;
+  table-layout: fixed;
+  width: 100%;
+  font-variant-numeric: tabular-nums;
+}
+
+.ic-memo-sheet td,
+.ic-memo-sheet th {
+  vertical-align: middle;
+  overflow-wrap: anywhere;
+  word-break: normal;
+}
+

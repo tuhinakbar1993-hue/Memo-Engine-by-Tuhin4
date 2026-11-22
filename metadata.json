@@ -1,0 +1,6 @@
+{
+  "name": "Memo Engine by Tuhin",
+  "description": "Banking Settlement & Waiver Memo Engine — reads seven banking input documents and generates IC Memo, MEC Memo, Board Memo, and Sanction .docx files.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
