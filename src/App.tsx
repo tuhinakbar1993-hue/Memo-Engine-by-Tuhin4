@@ -24,14 +24,17 @@ import {
   parsePartyPerformancePdf,
   prepareBranchProposalSource,
   prepareMemoDocumentSource,
+  synthesizeBranchProposalSourceFromData,
   warmBranchProposalSource,
 } from './parsers/documentParsers';
 import type {
   AiSectionsData,
+  ApiStatusInfo,
   AppliedSyncState,
   BatchScrutinyState,
   BranchProposalData,
   BranchProposalSource,
+  CrossVerificationReport,
   DocumentKey,
   DocumentUploadMeta,
   ExtractedDocumentsState,
@@ -134,6 +137,57 @@ async function assertSseResponseOrThrow(response: Response, fallbackLabel: strin
       `API endpoint returned an HTML page instead of a streaming response for ${fallbackLabel}. Please reload the page and retry.`
     );
   }
+}
+
+async function fetchWithRetry(
+  input: RequestInfo | URL,
+  init?: RequestInit,
+  maxRetries = 2
+): Promise<Response> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    if (init?.signal?.aborted) {
+      throw new DOMException('The operation was aborted.', 'AbortError');
+    }
+    try {
+      const response = await fetch(input, init);
+      let shouldRetry = response.status === 502 || response.status === 504;
+      if (response.status === 503 && attempt < maxRetries) {
+        const clonedText = await response
+          .clone()
+          .text()
+          .catch(() => '');
+        if (!/missing|api\s*key|not configured/i.test(clonedText)) {
+          shouldRetry = true;
+        }
+      }
+      if (!shouldRetry || attempt === maxRetries) {
+        return response;
+      }
+    } catch (err) {
+      if ((err as { name?: string })?.name === 'AbortError') {
+        throw err;
+      }
+      lastError = err;
+      if (attempt === maxRetries) {
+        throw err;
+      }
+    }
+
+    const delayMs = 600 * Math.pow(2, attempt);
+    await new Promise<void>((resolve, reject) => {
+      const timer = window.setTimeout(() => {
+        init?.signal?.removeEventListener('abort', onAbort);
+        resolve();
+      }, delayMs);
+      const onAbort = () => {
+        window.clearTimeout(timer);
+        reject(new DOMException('The operation was aborted.', 'AbortError'));
+      };
+      init?.signal?.addEventListener('abort', onAbort, { once: true });
+    });
+  }
+  throw lastError instanceof Error ? lastError : new Error('Request failed after retries.');
 }
 
 const INITIAL_DOC_METAS: Record<DocumentKey, DocumentUploadMeta> = {
@@ -295,6 +349,8 @@ const INITIAL_BATCH_SCRUTINY: BatchScrutinyState = {
   failedSections: [],
   insufficientSections: [],
   skippedManualSections: [],
+  statusMessage: null,
+  startedAt: null,
 };
 
 const INITIAL_STAGE_BATCH_SCRUTINY: StageBatchScrutinyState = {
@@ -307,6 +363,19 @@ const INITIAL_STAGE_BATCH_SCRUTINY: StageBatchScrutinyState = {
   failedSections: [],
   insufficientSections: [],
   skippedManualSections: [],
+  statusMessage: null,
+  startedAt: null,
+};
+
+const INITIAL_API_STATUS: ApiStatusInfo = {
+  configured: false,
+  status: 'checking',
+  primaryModel: 'gemini-4-hydrogen',
+  fallbackModel: 'gemini-3.1-flash-lite',
+  models: [],
+  cachedSources: 0,
+  cachedResults: 0,
+  message: 'Checking AI Scrutiny API status...',
 };
 
 const DOC_FILE_PREFIX: Record<MemoDocType, string> = {
@@ -401,8 +470,19 @@ export default function App() {
   const [aiError, setAiError] = useState<string | null>(null);
   const [downloading, setDownloading] = useState(false);
   const [downloadingPdf, setDownloadingPdf] = useState(false);
+  const [apiStatus, setApiStatus] = useState<ApiStatusInfo>(INITIAL_API_STATUS);
+  const [verifyingApi, setVerifyingApi] = useState(false);
+  const [crossVerificationReport, setCrossVerificationReport] =
+    useState<CrossVerificationReport | null>(null);
+  const [crossVerifying, setCrossVerifying] = useState(false);
+  const [hasPersistedBpSource, setHasPersistedBpSource] = useState(false);
 
   const serverCachedSourceIdRef = useRef<string | null>(null);
+  const persistedBpSourceRef = useRef<BranchProposalSource | null>(null);
+  const persistedStageSourcesRef = useRef<Partial<Record<StageMemoDocType, BranchProposalSource>>>(
+    {}
+  );
+  const crossVerificationReportRef = useRef<CrossVerificationReport | null>(null);
   const stageSourceFilesRef = useRef<Partial<Record<StageMemoDocType, File>>>({});
   const stageServerCachedSourceIdsRef = useRef<Partial<Record<StageMemoDocType, string>>>({});
   const cacheWarmPromiseRef = useRef<{ sourceId?: string; promise: Promise<void> } | null>(null);
@@ -534,6 +614,9 @@ export default function App() {
     return {
       ...cur,
       stageSourceUploads: cleanUploads,
+      branchProposalSource: persistedBpSourceRef.current,
+      stageSources: persistedStageSourcesRef.current,
+      crossVerificationReport: crossVerificationReportRef.current,
     };
   };
 
@@ -550,6 +633,72 @@ export default function App() {
       persistTimerRef.current = null;
       void saveCentralCaseState(serializeCaseForStorage(), docMetasRef.current);
     }, 150);
+  };
+
+  const warmServerSourceCache = async (src: BranchProposalSource | null | undefined) => {
+    if (!src?.sourceId) return;
+    try {
+      const resp = await fetch('/api/gemini/cache-source', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sourceId: src.sourceId, branchProposalSource: src }),
+      });
+      if (resp.ok && (resp.headers.get('content-type') ?? '').toLowerCase().includes('application/json')) {
+        serverCachedSourceIdRef.current = src.sourceId;
+      }
+    } catch {
+      // Silent pre-warm fallback; on-demand requests send full source if needed
+    }
+  };
+
+  const refreshApiStatus = async () => {
+    try {
+      const resp = await fetch('/api/gemini/status');
+      const data = await parseJsonResponse<ApiStatusInfo>(resp, 'API status check failed');
+      setApiStatus((prev) => ({
+        ...data,
+        verified: prev.verified,
+        latencyMs: prev.latencyMs,
+        lastCheckedAt: prev.lastCheckedAt ?? data.lastCheckedAt,
+      }));
+    } catch (err) {
+      setApiStatus((prev) => ({
+        ...prev,
+        status: 'error',
+        message: err instanceof Error ? err.message : 'Unable to reach AI Scrutiny API server.',
+      }));
+    }
+  };
+
+  const handleVerifyApi = async () => {
+    if (verifyingApi) return;
+    setVerifyingApi(true);
+    try {
+      const resp = await fetchWithRetry('/api/gemini/verify', { method: 'POST' }, 1);
+      const rawText = await resp.text();
+      const contentType = resp.headers.get('content-type') ?? '';
+      if (!isHtmlPayload(contentType, rawText) && rawText.trim()) {
+        const data = JSON.parse(rawText) as ApiStatusInfo & { ok?: boolean };
+        setApiStatus(data);
+        if (!resp.ok && data.message) {
+          setAiError(data.message);
+        }
+      } else {
+        throw new Error(extractApiErrorFromRaw(rawText, contentType, resp.status, 'API verification'));
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'API connectivity test failed.';
+      setApiStatus((prev) => ({
+        ...prev,
+        status: 'error',
+        verified: false,
+        lastCheckedAt: new Date().toISOString(),
+        message: msg,
+      }));
+      setAiError(msg);
+    } finally {
+      setVerifyingApi(false);
+    }
   };
 
   const syncAppliedSnapshotFromRef = () => {
@@ -672,6 +821,7 @@ export default function App() {
   };
 
   useEffect(() => {
+    void refreshApiStatus();
     void loadAllTemplateRecords().then((loaded) => {
       setTemplates(loaded);
     });
@@ -752,6 +902,45 @@ export default function App() {
         });
       }
 
+      if (saved.branchProposalSource) {
+        persistedBpSourceRef.current = saved.branchProposalSource;
+        setHasPersistedBpSource(true);
+        void warmServerSourceCache(saved.branchProposalSource);
+      } else if (hydrated.extractedDocs.branchProposal) {
+        const synth = synthesizeBranchProposalSourceFromData(
+          hydrated.extractedDocs.branchProposal,
+          saved.docUploadedFlags?.branchProposal?.fileName || 'Branch_Proposal_Restored'
+        );
+        persistedBpSourceRef.current = synth;
+        setHasPersistedBpSource(true);
+        void warmServerSourceCache(synth);
+      }
+
+      if (saved.stageSources) {
+        persistedStageSourcesRef.current = saved.stageSources;
+        for (const docK of ['mec', 'board', 'sanction'] as StageMemoDocType[]) {
+          const stSrc = saved.stageSources[docK];
+          if (stSrc?.sourceId) {
+            void fetch('/api/gemini/cache-source', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ sourceId: stSrc.sourceId, branchProposalSource: stSrc }),
+            })
+              .then((resp) => {
+                if (resp.ok && stSrc.sourceId) {
+                  stageServerCachedSourceIdsRef.current[docK] = stSrc.sourceId;
+                }
+              })
+              .catch(() => undefined);
+          }
+        }
+      }
+
+      if (saved.crossVerificationReport) {
+        crossVerificationReportRef.current = saved.crossVerificationReport;
+        setCrossVerificationReport(saved.crossVerificationReport);
+      }
+
       const hydratedMemo = resolveICMemo(
         hydrated.extractedDocs,
         hydrated.manualInputs,
@@ -822,21 +1011,14 @@ export default function App() {
         // Pre-warm client page images + register server cache silently so AI calls start immediately
         const warmPromise = prepareBranchProposalSource(file)
           .then(async (src) => {
+            persistedBpSourceRef.current = src;
+            setHasPersistedBpSource(true);
+            void persistCentralCaseNow(true);
             if (!src.sourceId) return;
             if (cacheWarmPromiseRef.current?.promise === warmPromise) {
               cacheWarmPromiseRef.current.sourceId = src.sourceId;
             }
-            const resp = await fetch('/api/gemini/cache-source', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ sourceId: src.sourceId, branchProposalSource: src }),
-            });
-            if (
-              resp.ok &&
-              (resp.headers.get('content-type') ?? '').toLowerCase().includes('application/json')
-            ) {
-              serverCachedSourceIdRef.current = src.sourceId;
-            }
+            await warmServerSourceCache(src);
           })
           .catch(() => {
             // Silent pre-warm fallback; on-demand scrutiny sends source directly if needed
@@ -1162,11 +1344,35 @@ export default function App() {
     applyScrutinizedSectionsBatch([{ section, result }], true);
   };
 
+  const getActiveBranchProposalSource = async (): Promise<BranchProposalSource | null> => {
+    if (branchProposalFile) {
+      const src = await prepareBranchProposalSource(branchProposalFile);
+      persistedBpSourceRef.current = src;
+      setHasPersistedBpSource(true);
+      return src;
+    }
+    if (persistedBpSourceRef.current) {
+      return persistedBpSourceRef.current;
+    }
+    const bp = caseRef.current.extractedDocs.branchProposal;
+    if (bp) {
+      const synth = synthesizeBranchProposalSourceFromData(
+        bp,
+        docMetasRef.current.branchProposal.fileName || 'Branch_Proposal_Restored'
+      );
+      persistedBpSourceRef.current = synth;
+      setHasPersistedBpSource(true);
+      return synth;
+    }
+    return null;
+  };
+
   const fetchWithSourceCache = async (
     url: string,
     payload: Record<string, unknown>,
     source: BranchProposalSource,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    withRetry = false
   ): Promise<Response> => {
     if (
       source.sourceId &&
@@ -1181,28 +1387,28 @@ export default function App() {
     const canReuseServerCache =
       Boolean(source.sourceId) && serverCachedSourceIdRef.current === source.sourceId;
 
-    const firstResponse = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      signal,
-      body: JSON.stringify(
-        canReuseServerCache
-          ? { ...payload, sourceId: source.sourceId }
-          : { ...payload, sourceId: source.sourceId, branchProposalSource: source }
-      ),
-    });
-
-    if (firstResponse.status === 404 && canReuseServerCache) {
-      serverCachedSourceIdRef.current = null;
-      return fetch(url, {
+    const doFetch = (bodyObj: Record<string, unknown>) => {
+      const init: RequestInit = {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         signal,
-        body: JSON.stringify({
-          ...payload,
-          sourceId: source.sourceId,
-          branchProposalSource: source,
-        }),
+        body: JSON.stringify(bodyObj),
+      };
+      return withRetry ? fetchWithRetry(url, init, 2) : fetch(url, init);
+    };
+
+    const firstResponse = await doFetch(
+      canReuseServerCache
+        ? { ...payload, sourceId: source.sourceId }
+        : { ...payload, sourceId: source.sourceId, branchProposalSource: source }
+    );
+
+    if (firstResponse.status === 404 && canReuseServerCache) {
+      serverCachedSourceIdRef.current = null;
+      return doFetch({
+        ...payload,
+        sourceId: source.sourceId,
+        branchProposalSource: source,
       });
     }
 
@@ -1214,7 +1420,8 @@ export default function App() {
     forceOverwrite = false
   ) => {
     if (batchScrutiny.running) return;
-    if (!branchProposalFile) {
+    const branchProposalSource = await getActiveBranchProposalSource();
+    if (!branchProposalSource) {
       setAiError(
         'Branch Proposal is not uploaded yet. Please upload the Branch Proposal on the Manual Inputs tab first.'
       );
@@ -1232,13 +1439,14 @@ export default function App() {
     setAiError(null);
 
     try {
-      const branchProposalSource = await prepareBranchProposalSource(branchProposalFile);
       const context = buildScrutinyContext('ic');
 
       const response = await fetchWithSourceCache(
         '/api/gemini/scrutinize-section',
         { section, context },
-        branchProposalSource
+        branchProposalSource,
+        undefined,
+        true
       );
 
       const data = await parseJsonResponse<{
@@ -1280,8 +1488,10 @@ export default function App() {
           insufficientSections: nextInsufficient,
         };
       });
+      void refreshApiStatus();
     } catch (err) {
       setAiError(err instanceof Error ? err.message : 'Failed to scrutinize section.');
+      void refreshApiStatus();
     } finally {
       setScrutinizingSection(null);
     }
@@ -1289,7 +1499,8 @@ export default function App() {
 
   const handleRetrySection = async (section: ScrutinySectionKey) => {
     if (batchScrutiny.running) return;
-    if (!branchProposalFile) {
+    const branchProposalSource = await getActiveBranchProposalSource();
+    if (!branchProposalSource) {
       setAiError(
         'Branch Proposal is not uploaded yet. Please upload the Branch Proposal on the Manual Inputs tab first.'
       );
@@ -1306,13 +1517,14 @@ export default function App() {
     }));
 
     try {
-      const branchProposalSource = await prepareBranchProposalSource(branchProposalFile);
       const context = buildScrutinyContext('ic');
 
       const response = await fetchWithSourceCache(
         '/api/gemini/scrutinize-section',
         { section, context },
-        branchProposalSource
+        branchProposalSource,
+        undefined,
+        true
       );
 
       const data = await parseJsonResponse<{
@@ -1347,6 +1559,7 @@ export default function App() {
             ]
           : prev.insufficientSections.filter((item) => item.section !== section),
       }));
+      void refreshApiStatus();
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : 'Retry failed for this section.';
       setBatchScrutiny((prev) => {
@@ -1357,6 +1570,7 @@ export default function App() {
           failedSections: [...others, { section, error: errMsg }],
         };
       });
+      void refreshApiStatus();
     } finally {
       setBatchScrutiny((prev) => ({
         ...prev,
@@ -1365,9 +1579,14 @@ export default function App() {
     }
   };
 
+  const handleCancelBatchScrutiny = () => {
+    batchAbortRef.current?.abort();
+  };
+
   const handleScrutinizeAll = async () => {
     if (batchScrutiny.running || scrutinizingSection !== null) return;
-    if (!branchProposalFile) {
+    const branchProposalSource = await getActiveBranchProposalSource();
+    if (!branchProposalSource) {
       setAiError(
         'Branch Proposal is not uploaded yet. Please upload the Branch Proposal on the Manual Inputs tab first.'
       );
@@ -1403,6 +1622,8 @@ export default function App() {
         failedSections: [],
         insufficientSections: [],
         skippedManualSections,
+        statusMessage: null,
+        startedAt: null,
       });
       return;
     }
@@ -1416,10 +1637,11 @@ export default function App() {
       failedSections: [],
       insufficientSections: [],
       skippedManualSections,
+      statusMessage: 'Preparing Branch Proposal & connecting to Gemini AI stream...',
+      startedAt: Date.now(),
     });
 
     try {
-      const branchProposalSource = await prepareBranchProposalSource(branchProposalFile);
       const context = buildScrutinyContext('ic');
 
       const response = await fetchWithSourceCache(
@@ -1451,6 +1673,7 @@ export default function App() {
           reason: string;
         }> = [];
         const errorItems: Array<{ section: ScrutinySectionKey; error: string }> = [];
+        let nextStatusMessage: string | undefined;
 
         for (const frame of frames) {
           const dataLines = frame
@@ -1462,7 +1685,8 @@ export default function App() {
           const rawPayload = dataLines.join('\n');
           try {
             const event = JSON.parse(rawPayload) as {
-              type: 'section' | 'error' | 'fatal' | 'done';
+              type: 'status' | 'section' | 'error' | 'fatal' | 'done';
+              message?: string;
               section?: ScrutinySectionKey;
               result?: Record<string, unknown>;
               insufficient?: boolean;
@@ -1471,7 +1695,9 @@ export default function App() {
               sourceId?: string;
             };
 
-            if (event.type === 'section' && event.section && event.result) {
+            if (event.type === 'status' && event.message) {
+              nextStatusMessage = event.message;
+            } else if (event.type === 'section' && event.section && event.result) {
               const sec = event.section;
               sectionItems.push({ section: sec, result: event.result });
               sectionStatuses.push({
@@ -1500,7 +1726,7 @@ export default function App() {
           applyScrutinizedSectionsBatch(sectionItems, false);
         }
 
-        if (sectionStatuses.length > 0 || errorItems.length > 0) {
+        if (sectionStatuses.length > 0 || errorItems.length > 0 || nextStatusMessage !== undefined) {
           setBatchScrutiny((prev) => {
             let nextCompleted = prev.completedSections;
             let nextFailed = prev.failedSections;
@@ -1534,6 +1760,7 @@ export default function App() {
               completedSections: nextCompleted,
               failedSections: nextFailed,
               insufficientSections: nextInsufficient,
+              statusMessage: nextStatusMessage ?? prev.statusMessage,
             };
           });
         }
@@ -1562,7 +1789,15 @@ export default function App() {
       }
     } finally {
       void persistCentralCaseNow(true);
+      void refreshApiStatus();
       setBatchScrutiny((prev) => {
+        if (controller.signal.aborted) {
+          return {
+            ...prev,
+            running: false,
+            statusMessage: 'Stopped by user. Completed sections were preserved.',
+          };
+        }
         const completedSet = new Set(prev.completedSections);
         const failedSet = new Set(prev.failedSections.map((f) => f.section));
         const uncompleted = prev.targetSections.filter(
@@ -1575,12 +1810,70 @@ export default function App() {
         return {
           ...prev,
           running: false,
+          statusMessage: null,
           failedSections: [...prev.failedSections, ...extraFailures],
         };
       });
       if (batchAbortRef.current === controller) {
         batchAbortRef.current = null;
       }
+    }
+  };
+
+  const handleRunCrossVerification = async () => {
+    if (crossVerifying) return;
+    setCrossVerifying(true);
+    setAiError(null);
+    try {
+      const latest = caseRef.current;
+      const latestMemo = resolveICMemo(
+        latest.extractedDocs,
+        latest.manualInputs,
+        latest.aiSections,
+        latest.overrides,
+        latest.manualEditedSections
+      );
+      const bpSource = await getActiveBranchProposalSource();
+      const payload = {
+        placeholders: latestMemo.placeholders,
+        extractedDocs: {
+          branchProposal: latest.extractedDocs.branchProposal,
+          outstanding: latest.extractedDocs.outstanding,
+          partyPerformance: latest.extractedDocs.partyPerformance,
+          overdue: latest.extractedDocs.overdue,
+          accountStatement: latest.extractedDocs.accountStatement,
+          cibReport: latest.extractedDocs.cibReport,
+          costOfFund: latest.extractedDocs.costOfFund,
+        },
+        manualInputs: latest.manualInputs,
+        aiSections: latest.aiSections,
+      };
+      const resp = bpSource
+        ? await fetchWithSourceCache('/api/gemini/cross-verify', payload, bpSource, undefined, true)
+        : await fetchWithRetry(
+            '/api/gemini/cross-verify',
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload),
+            },
+            2
+          );
+      const data = await parseJsonResponse<{ report?: CrossVerificationReport }>(
+        resp,
+        'Cross-verification failed'
+      );
+      if (data.report) {
+        crossVerificationReportRef.current = data.report;
+        setCrossVerificationReport(data.report);
+        void persistCentralCaseNow(true);
+      }
+      void refreshApiStatus();
+    } catch (err) {
+      setAiError(err instanceof Error ? err.message : 'Cross-verification failed.');
+      void refreshApiStatus();
+    } finally {
+      setCrossVerifying(false);
     }
   };
 
@@ -1632,6 +1925,7 @@ export default function App() {
   const handleClearStageSource = (docType: StageMemoDocType) => {
     delete stageSourceFilesRef.current[docType];
     delete stageServerCachedSourceIdsRef.current[docType];
+    delete persistedStageSourcesRef.current[docType];
     const defaults = createInitialStageSourceUploads();
     setStageSourceUploadsSync((prev) => ({
       ...prev,
@@ -1654,6 +1948,11 @@ export default function App() {
       }
 
       serverCachedSourceIdRef.current = null;
+      persistedBpSourceRef.current = null;
+      persistedStageSourcesRef.current = {};
+      crossVerificationReportRef.current = null;
+      setHasPersistedBpSource(false);
+      setCrossVerificationReport(null);
       stageSourceFilesRef.current = {};
       stageServerCachedSourceIdsRef.current = {};
       cacheWarmPromiseRef.current = null;
@@ -1742,6 +2041,7 @@ export default function App() {
           },
         }));
       });
+      persistedStageSourcesRef.current[docType] = prepared;
 
       setStageSourceUploadsSync((prev) => ({
         ...prev,
@@ -1761,17 +2061,21 @@ export default function App() {
         existingSnapshot.manualEditedSections
       );
 
-      const response = await fetch('/api/gemini/extract-stage-source', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          targetDocType: docType,
-          sourceId: cachedId,
-          memoSource: prepared,
-          stageInputs: existingSnapshot.stageInputs,
-          existingContext: { placeholders: currentResolved.placeholders },
-        }),
-      });
+      const response = await fetchWithRetry(
+        '/api/gemini/extract-stage-source',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            targetDocType: docType,
+            sourceId: cachedId,
+            memoSource: prepared,
+            stageInputs: existingSnapshot.stageInputs,
+            existingContext: { placeholders: currentResolved.placeholders },
+          }),
+        },
+        2
+      );
 
       const data = await parseJsonResponse<{
         sourceId?: string;
@@ -2118,41 +2422,69 @@ export default function App() {
   const fetchStageEndpoint = async (
     url: string,
     payload: Record<string, unknown>,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    withRetry = false
   ): Promise<Response> => {
     const docType = payload.docType as StageMemoDocType | undefined;
     const stageFile = docType ? stageSourceFilesRef.current[docType] : undefined;
-    if (stageFile && docType) {
-      const stageSource = await prepareMemoDocumentSource(stageFile);
-      return fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal,
-        body: JSON.stringify({
-          ...payload,
-          sourceId: stageServerCachedSourceIdsRef.current[docType] || stageSource.sourceId,
-          stageSource,
-        }),
-      });
+    const stageSource =
+      stageFile && docType
+        ? await prepareMemoDocumentSource(stageFile)
+        : docType
+          ? persistedStageSourcesRef.current[docType]
+          : undefined;
+
+    if (stageSource && docType) {
+      persistedStageSourcesRef.current[docType] = stageSource;
+      const canReuseStageCache =
+        Boolean(stageSource.sourceId) &&
+        stageServerCachedSourceIdsRef.current[docType] === stageSource.sourceId;
+      const doStageFetch = (bodyObj: Record<string, unknown>) => {
+        const init: RequestInit = {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal,
+          body: JSON.stringify(bodyObj),
+        };
+        return withRetry ? fetchWithRetry(url, init, 2) : fetch(url, init);
+      };
+
+      const firstResp = await doStageFetch(
+        canReuseStageCache
+          ? { ...payload, sourceId: stageSource.sourceId }
+          : { ...payload, sourceId: stageSource.sourceId, stageSource }
+      );
+      if (firstResp.status === 404 && canReuseStageCache) {
+        delete stageServerCachedSourceIdsRef.current[docType];
+        return doStageFetch({ ...payload, sourceId: stageSource.sourceId, stageSource });
+      }
+      if (firstResp.ok && stageSource.sourceId) {
+        stageServerCachedSourceIdsRef.current[docType] = stageSource.sourceId;
+      }
+      return firstResp;
     }
-    if (branchProposalFile) {
-      const source = await prepareBranchProposalSource(branchProposalFile);
-      return fetchWithSourceCache(url, payload, source, signal);
+
+    const bpSource = await getActiveBranchProposalSource();
+    if (bpSource) {
+      return fetchWithSourceCache(url, payload, bpSource, signal, withRetry);
     }
-    return fetch(url, {
+    const init: RequestInit = {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       signal,
       body: JSON.stringify(payload),
-    });
+    };
+    return withRetry ? fetchWithRetry(url, init, 2) : fetch(url, init);
   };
 
   const hasStageOrCaseSource = (docType: StageMemoDocType) =>
     Boolean(
       branchProposalFile ||
+        hasPersistedBpSource ||
         caseRef.current.extractedDocs.branchProposal ||
         resolvedICMemo.placeholders['#2#'] ||
         stageSourceFilesRef.current[docType] ||
+        persistedStageSourcesRef.current[docType] ||
         caseRef.current.stageSourceUploads[docType]?.uploaded
     );
 
@@ -2177,11 +2509,16 @@ export default function App() {
 
     try {
       const context = buildScrutinyContext();
-      const response = await fetchStageEndpoint('/api/gemini/scrutinize-stage-section', {
-        docType,
-        section,
-        context,
-      });
+      const response = await fetchStageEndpoint(
+        '/api/gemini/scrutinize-stage-section',
+        {
+          docType,
+          section,
+          context,
+        },
+        undefined,
+        true
+      );
 
       const data = await parseJsonResponse<{
         result?: { text?: string };
@@ -2220,8 +2557,10 @@ export default function App() {
             : prev.insufficientSections.filter((item) => item.section !== section),
         };
       });
+      void refreshApiStatus();
     } catch (err) {
       setAiError(err instanceof Error ? err.message : 'Failed to scrutinize stage section.');
+      void refreshApiStatus();
     } finally {
       setScrutinizingStageSection(null);
     }
@@ -2245,11 +2584,16 @@ export default function App() {
 
     try {
       const context = buildScrutinyContext();
-      const response = await fetchStageEndpoint('/api/gemini/scrutinize-stage-section', {
-        docType,
-        section,
-        context,
-      });
+      const response = await fetchStageEndpoint(
+        '/api/gemini/scrutinize-stage-section',
+        {
+          docType,
+          section,
+          context,
+        },
+        undefined,
+        true
+      );
 
       const data = await parseJsonResponse<{
         result?: { text?: string };
@@ -2286,6 +2630,7 @@ export default function App() {
             ]
           : prev.insufficientSections.filter((item) => item.section !== section),
       }));
+      void refreshApiStatus();
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : 'Retry failed for this section.';
       setStageBatchScrutiny((prev) => ({
@@ -2297,12 +2642,17 @@ export default function App() {
           { section, error: errMsg },
         ],
       }));
+      void refreshApiStatus();
     } finally {
       setStageBatchScrutiny((prev) => ({
         ...prev,
         retryingSections: prev.retryingSections.filter((s) => s !== section),
       }));
     }
+  };
+
+  const handleCancelStageBatchScrutiny = () => {
+    stageBatchAbortRef.current?.abort();
   };
 
   const handleScrutinizeStageAll = async (docType: StageMemoDocType) => {
@@ -2341,6 +2691,8 @@ export default function App() {
         failedSections: [],
         insufficientSections: [],
         skippedManualSections,
+        statusMessage: null,
+        startedAt: null,
       });
       return;
     }
@@ -2355,6 +2707,8 @@ export default function App() {
       failedSections: [],
       insufficientSections: [],
       skippedManualSections,
+      statusMessage: `Connecting to Gemini AI stream for ${docType.toUpperCase()} scrutiny...`,
+      startedAt: Date.now(),
     });
 
     try {
@@ -2383,6 +2737,7 @@ export default function App() {
           reason: string;
         }> = [];
         const errorItems: Array<{ section: StageScrutinySectionKey; error: string }> = [];
+        let nextStatusMessage: string | undefined;
 
         for (const frame of frames) {
           const dataLines = frame
@@ -2393,7 +2748,8 @@ export default function App() {
 
           try {
             const event = JSON.parse(dataLines.join('\n')) as {
-              type: 'section' | 'error' | 'fatal' | 'done';
+              type: 'status' | 'section' | 'error' | 'fatal' | 'done';
+              message?: string;
               section?: StageScrutinySectionKey;
               result?: { text?: string };
               insufficient?: boolean;
@@ -2402,7 +2758,9 @@ export default function App() {
               sourceId?: string;
             };
 
-            if (event.type === 'section' && event.section && event.result) {
+            if (event.type === 'status' && event.message) {
+              nextStatusMessage = event.message;
+            } else if (event.type === 'section' && event.section && event.result) {
               sectionItems.push({
                 section: event.section,
                 text: String(event.result.text ?? '').trim(),
@@ -2445,7 +2803,7 @@ export default function App() {
           void persistCentralCaseNow(false);
         }
 
-        if (sectionItems.length > 0 || errorItems.length > 0) {
+        if (sectionItems.length > 0 || errorItems.length > 0 || nextStatusMessage !== undefined) {
           setStageBatchScrutiny((prev) => {
             let nextCompleted = prev.completedSections;
             let nextFailed = prev.failedSections;
@@ -2479,6 +2837,7 @@ export default function App() {
               completedSections: nextCompleted,
               failedSections: nextFailed,
               insufficientSections: nextInsufficient,
+              statusMessage: nextStatusMessage ?? prev.statusMessage,
             };
           });
         }
@@ -2507,7 +2866,15 @@ export default function App() {
       }
     } finally {
       void persistCentralCaseNow(true);
+      void refreshApiStatus();
       setStageBatchScrutiny((prev) => {
+        if (controller.signal.aborted) {
+          return {
+            ...prev,
+            running: false,
+            statusMessage: 'Stopped by user. Completed sections were preserved.',
+          };
+        }
         const completedSet = new Set(prev.completedSections);
         const failedSet = new Set(prev.failedSections.map((f) => f.section));
         const uncompleted = prev.targetSections.filter(
@@ -2520,6 +2887,7 @@ export default function App() {
         return {
           ...prev,
           running: false,
+          statusMessage: null,
           failedSections: [...prev.failedSections, ...extraFailures],
         };
       });
@@ -2796,6 +3164,7 @@ export default function App() {
             onScrutinizeSection={handleScrutinizeSection}
             onRetrySection={handleRetrySection}
             onScrutinizeAll={handleScrutinizeAll}
+            onCancelBatchScrutiny={handleCancelBatchScrutiny}
             onDismissBatchSummary={() => setBatchScrutiny(INITIAL_BATCH_SCRUTINY)}
             batchScrutiny={batchScrutiny}
             onUpdateAiSections={handleUpdateAiSections}
@@ -2803,8 +3172,22 @@ export default function App() {
             sourceOfRepaymentManual={manualInputs.sourceOfRepayment}
             onManualSourceOfRepaymentChange={handleManualSourceOfRepaymentChange}
             scrutinizingSection={scrutinizingSection}
-            hasBranchProposal={branchProposalFile !== null}
+            hasBranchProposal={
+              branchProposalFile !== null ||
+              hasPersistedBpSource ||
+              extractedDocs.branchProposal !== null
+            }
             aiError={aiError}
+            apiStatus={apiStatus}
+            verifyingApi={verifyingApi}
+            onVerifyApi={handleVerifyApi}
+            crossVerificationReport={crossVerificationReport}
+            crossVerifying={crossVerifying}
+            onRunCrossVerification={handleRunCrossVerification}
+            onDismissCrossVerification={() => {
+              crossVerificationReportRef.current = null;
+              setCrossVerificationReport(null);
+            }}
             onDownloadDocx={() => handleDownloadDocx('ic')}
             onDownloadPdf={() => handleDownloadPdf('ic')}
             downloading={downloading}
@@ -2827,7 +3210,11 @@ export default function App() {
             stageManualEditedSections={stageManualEditedSections}
             scrutinizingStageSection={scrutinizingStageSection}
             stageBatchScrutiny={stageBatchScrutiny}
-            hasBranchProposalFile={branchProposalFile !== null}
+            hasBranchProposalFile={
+              branchProposalFile !== null ||
+              hasPersistedBpSource ||
+              extractedDocs.branchProposal !== null
+            }
             hasAnyCaseData={Boolean(
               resolvedICMemo.placeholders['#2#'] || resolvedICMemo.branchProposal
             )}
@@ -2835,11 +3222,15 @@ export default function App() {
             onUploadStageSource={handleUploadStageSource}
             onClearStageSource={handleClearStageSource}
             aiError={aiError}
+            apiStatus={apiStatus}
+            verifyingApi={verifyingApi}
+            onVerifyApi={handleVerifyApi}
             onStageInputChange={handleStageInputChange}
             onUpdateStageAiSection={handleUpdateStageAiSection}
             onScrutinizeStageSection={handleScrutinizeStageSection}
             onRetryStageSection={handleRetryStageSection}
             onScrutinizeStageAll={handleScrutinizeStageAll}
+            onCancelStageBatchScrutiny={handleCancelStageBatchScrutiny}
             onDismissStageBatchSummary={() =>
               setStageBatchScrutiny(INITIAL_STAGE_BATCH_SCRUTINY)
             }
@@ -2866,7 +3257,11 @@ export default function App() {
             stageManualEditedSections={stageManualEditedSections}
             scrutinizingStageSection={scrutinizingStageSection}
             stageBatchScrutiny={stageBatchScrutiny}
-            hasBranchProposalFile={branchProposalFile !== null}
+            hasBranchProposalFile={
+              branchProposalFile !== null ||
+              hasPersistedBpSource ||
+              extractedDocs.branchProposal !== null
+            }
             hasAnyCaseData={Boolean(
               resolvedICMemo.placeholders['#2#'] || resolvedICMemo.branchProposal
             )}
@@ -2874,11 +3269,15 @@ export default function App() {
             onUploadStageSource={handleUploadStageSource}
             onClearStageSource={handleClearStageSource}
             aiError={aiError}
+            apiStatus={apiStatus}
+            verifyingApi={verifyingApi}
+            onVerifyApi={handleVerifyApi}
             onStageInputChange={handleStageInputChange}
             onUpdateStageAiSection={handleUpdateStageAiSection}
             onScrutinizeStageSection={handleScrutinizeStageSection}
             onRetryStageSection={handleRetryStageSection}
             onScrutinizeStageAll={handleScrutinizeStageAll}
+            onCancelStageBatchScrutiny={handleCancelStageBatchScrutiny}
             onDismissStageBatchSummary={() =>
               setStageBatchScrutiny(INITIAL_STAGE_BATCH_SCRUTINY)
             }
@@ -2905,7 +3304,11 @@ export default function App() {
             stageManualEditedSections={stageManualEditedSections}
             scrutinizingStageSection={scrutinizingStageSection}
             stageBatchScrutiny={stageBatchScrutiny}
-            hasBranchProposalFile={branchProposalFile !== null}
+            hasBranchProposalFile={
+              branchProposalFile !== null ||
+              hasPersistedBpSource ||
+              extractedDocs.branchProposal !== null
+            }
             hasAnyCaseData={Boolean(
               resolvedICMemo.placeholders['#2#'] || resolvedICMemo.branchProposal
             )}
@@ -2913,11 +3316,15 @@ export default function App() {
             onUploadStageSource={handleUploadStageSource}
             onClearStageSource={handleClearStageSource}
             aiError={aiError}
+            apiStatus={apiStatus}
+            verifyingApi={verifyingApi}
+            onVerifyApi={handleVerifyApi}
             onStageInputChange={handleStageInputChange}
             onUpdateStageAiSection={handleUpdateStageAiSection}
             onScrutinizeStageSection={handleScrutinizeStageSection}
             onRetryStageSection={handleRetryStageSection}
             onScrutinizeStageAll={handleScrutinizeStageAll}
+            onCancelStageBatchScrutiny={handleCancelStageBatchScrutiny}
             onDismissStageBatchSummary={() =>
               setStageBatchScrutiny(INITIAL_STAGE_BATCH_SCRUTINY)
             }

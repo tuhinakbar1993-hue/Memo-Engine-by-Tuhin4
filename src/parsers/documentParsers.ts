@@ -384,6 +384,8 @@ export function warmBranchProposalSource(file: File): void {
   }
 }
 
+const inFlightStageSourcePrep = new Map<string, Promise<BranchProposalSource>>();
+
 /**
  * Prepares any completed stage memo upload (IC Memo, MEC Memo, or Board Memo)
  * in PDF, Word (.docx), Excel (.xlsx/.xls), or image format for multimodal AI extraction & scrutiny.
@@ -398,79 +400,112 @@ export async function prepareMemoDocumentSource(
     return cached;
   }
 
+  const sig = getFileSignature('stage_memo_source', file);
+  const existingPromise = inFlightStageSourcePrep.get(sig);
+  if (existingPromise) return existingPromise;
+
   const sourceId = getFileSignature('stage_src', file);
 
-  if (isDocxFile(file)) {
-    onStage?.('Extracting Word (.docx) paragraphs and tables...');
-    const docx = await extractDocxContent(file);
-    return setCachedParse('stage_memo_source', file, {
-      sourceId,
-      fileName: file.name,
-      rawText: docx.rawText,
-      pageImages: [],
-    });
-  }
-
-  if (isExcelFile(file)) {
-    onStage?.('Extracting spreadsheet worksheets...');
-    const excel = await extractExcelContent(file);
-    return setCachedParse('stage_memo_source', file, {
-      sourceId,
-      fileName: file.name,
-      rawText: excel.rawText,
-      pageImages: [],
-    });
-  }
-
-  if (file.type.startsWith('image/')) {
-    onStage?.('Preparing image for AI visual scrutiny...');
-    const dataUrl = await new Promise<string>((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(String(reader.result ?? ''));
-      reader.onerror = () => reject(new Error('Failed to read image file.'));
-      reader.readAsDataURL(file);
-    });
-    const base64 = dataUrl.split(',')[1] ?? '';
-    return setCachedParse('stage_memo_source', file, {
-      sourceId,
-      fileName: file.name,
-      rawText: '',
-      pageImages: base64 ? [{ mimeType: file.type || 'image/jpeg', data: base64 }] : [],
-    });
-  }
-
-  onStage?.('Reading PDF pages and rendering page visuals...');
-  const [extracted, rendered] = await Promise.all([
-    extractPdfLines(file),
-    renderPdfPagesToImages(file, 860, 14),
-  ]);
-
-  let rawText = extracted.rawText;
-  if (rawText.trim().length < 250 && rendered.length > 0) {
-    onStage?.('Running OCR fallback on scanned PDF pages...');
-    try {
-      const ocr = await ocrImagesToPdfLines(
-        rendered.slice(0, 8).map((r) => ({
-          dataUrl: `data:${r.mimeType};base64,${r.data}`,
-          width: r.width,
-          height: r.height,
-        })),
-        onStage
-      );
-      if (ocr.rawText.trim().length > rawText.trim().length) {
-        rawText = ocr.rawText;
-      }
-    } catch {
-      // Proceed with visual pageImages for multimodal Gemini scrutiny
+  const task = (async (): Promise<BranchProposalSource> => {
+    if (isDocxFile(file)) {
+      onStage?.('Extracting Word (.docx) paragraphs and tables...');
+      const docx = await extractDocxContent(file);
+      return setCachedParse('stage_memo_source', file, {
+        sourceId,
+        fileName: file.name,
+        rawText: docx.rawText,
+        pageImages: [],
+      });
     }
-  }
 
-  return setCachedParse('stage_memo_source', file, {
-    sourceId,
-    fileName: file.name,
-    rawText,
-    pageImages: rendered.map((r) => ({ mimeType: r.mimeType, data: r.data })),
-  });
+    if (isExcelFile(file)) {
+      onStage?.('Extracting spreadsheet worksheets...');
+      const excel = await extractExcelContent(file);
+      return setCachedParse('stage_memo_source', file, {
+        sourceId,
+        fileName: file.name,
+        rawText: excel.rawText,
+        pageImages: [],
+      });
+    }
+
+    if (file.type.startsWith('image/')) {
+      onStage?.('Preparing image for AI visual scrutiny...');
+      const dataUrl = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result ?? ''));
+        reader.onerror = () => reject(new Error('Failed to read image file.'));
+        reader.readAsDataURL(file);
+      });
+      const base64 = dataUrl.split(',')[1] ?? '';
+      return setCachedParse('stage_memo_source', file, {
+        sourceId,
+        fileName: file.name,
+        rawText: '',
+        pageImages: base64 ? [{ mimeType: file.type || 'image/jpeg', data: base64 }] : [],
+      });
+    }
+
+    onStage?.('Reading PDF pages and rendering page visuals...');
+    const [extracted, rendered] = await Promise.all([
+      extractPdfLines(file),
+      renderPdfPagesToImages(file, 860, 14),
+    ]);
+
+    let rawText = extracted.rawText;
+    if (rawText.trim().length < 250 && rendered.length > 0) {
+      onStage?.('Running OCR fallback on scanned PDF pages...');
+      try {
+        const ocr = await ocrImagesToPdfLines(
+          rendered.slice(0, 8).map((r) => ({
+            dataUrl: `data:${r.mimeType};base64,${r.data}`,
+            width: r.width,
+            height: r.height,
+          })),
+          onStage
+        );
+        if (ocr.rawText.trim().length > rawText.trim().length) {
+          rawText = ocr.rawText;
+        }
+      } catch {
+        // Proceed with visual pageImages for multimodal Gemini scrutiny
+      }
+    }
+
+    return setCachedParse('stage_memo_source', file, {
+      sourceId,
+      fileName: file.name,
+      rawText,
+      pageImages: rendered.map((r) => ({ mimeType: r.mimeType, data: r.data })),
+    });
+  })();
+
+  inFlightStageSourcePrep.set(sig, task);
+  try {
+    return await task;
+  } finally {
+    inFlightStageSourcePrep.delete(sig);
+  }
+}
+
+/**
+ * Fallback serializer when Branch Proposal data was restored from storage without raw file bytes.
+ */
+export function synthesizeBranchProposalSourceFromData(
+  bp: BranchProposalData,
+  fileName = 'Branch Proposal (Restored Session)'
+): BranchProposalSource {
+  const serialized = JSON.stringify(bp, null, 2);
+  let hash = 0;
+  for (let i = 0; i < serialized.length; i++) {
+    hash = (hash * 31 + serialized.charCodeAt(i)) | 0;
+  }
+  return {
+    sourceId: `restored_bp_${Math.abs(hash)}`,
+    fileName,
+    rawText: `Structured Branch Proposal Data (Restored from Case Storage):\n${serialized}`,
+    pageImages: [],
+  };
 }
 
 /**

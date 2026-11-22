@@ -8,13 +8,19 @@ import {
   Plus,
   RefreshCw,
   RotateCcw,
+  ShieldCheck,
   Sparkles,
+  Square,
   Trash2,
+  Wifi,
+  WifiOff,
   X,
 } from 'lucide-react';
 import type {
   AiSectionsData,
+  ApiStatusInfo,
   BatchScrutinyState,
+  CrossVerificationReport,
   MemoDocType,
   MemoTemplateRecord,
   ResolvedICMemo,
@@ -61,6 +67,7 @@ interface ICMemoPreviewProps {
   onScrutinizeSection: (section: ScrutinySectionKey, forceOverwrite?: boolean) => Promise<void>;
   onRetrySection: (section: ScrutinySectionKey) => Promise<void>;
   onScrutinizeAll: () => Promise<void>;
+  onCancelBatchScrutiny: () => void;
   onDismissBatchSummary: () => void;
   batchScrutiny: BatchScrutinyState;
   onUpdateAiSections: (
@@ -73,6 +80,13 @@ interface ICMemoPreviewProps {
   scrutinizingSection: ScrutinySectionKey | null;
   hasBranchProposal: boolean;
   aiError: string | null;
+  apiStatus: ApiStatusInfo;
+  verifyingApi: boolean;
+  onVerifyApi: () => Promise<void>;
+  crossVerificationReport: CrossVerificationReport | null;
+  crossVerifying: boolean;
+  onRunCrossVerification: () => Promise<void>;
+  onDismissCrossVerification: () => void;
   onDownloadDocx: () => Promise<void>;
   onDownloadPdf: () => Promise<void>;
   downloading: boolean;
@@ -242,6 +256,7 @@ export const ICMemoPreview: React.FC<ICMemoPreviewProps> = ({
   onScrutinizeSection,
   onRetrySection,
   onScrutinizeAll,
+  onCancelBatchScrutiny,
   onDismissBatchSummary,
   batchScrutiny,
   onUpdateAiSections,
@@ -251,6 +266,13 @@ export const ICMemoPreview: React.FC<ICMemoPreviewProps> = ({
   scrutinizingSection,
   hasBranchProposal,
   aiError,
+  apiStatus,
+  verifyingApi,
+  onVerifyApi,
+  crossVerificationReport,
+  crossVerifying,
+  onRunCrossVerification,
+  onDismissCrossVerification,
   onDownloadDocx,
   onDownloadPdf,
   downloading,
@@ -267,6 +289,20 @@ export const ICMemoPreview: React.FC<ICMemoPreviewProps> = ({
 
   const [editingSections, setEditingSections] = useState<Partial<Record<ScrutinySectionKey, boolean>>>({});
   const [confirmOverwriteSection, setConfirmOverwriteSection] = useState<ScrutinySectionKey | null>(null);
+  const [elapsedSec, setElapsedSec] = useState(0);
+
+  useEffect(() => {
+    if (!batchScrutiny.running || !batchScrutiny.startedAt) {
+      setElapsedSec(0);
+      return;
+    }
+    const updateElapsed = () => {
+      setElapsedSec(Math.max(0, Math.floor((Date.now() - (batchScrutiny.startedAt ?? Date.now())) / 1000)));
+    };
+    updateElapsed();
+    const timer = window.setInterval(updateElapsed, 1000);
+    return () => window.clearInterval(timer);
+  }, [batchScrutiny.running, batchScrutiny.startedAt]);
 
   useEffect(() => {
     if (applySignal > 0) {
@@ -563,77 +599,155 @@ export const ICMemoPreview: React.FC<ICMemoPreviewProps> = ({
   return (
     <div className="max-w-6xl mx-auto space-y-6">
       {/* Top Preview Controls */}
-      <div className="bg-white border border-slate-200 rounded-lg p-4 flex flex-wrap items-center justify-between gap-4">
-        <div>
-          <h2 className="font-display text-lg font-bold text-slate-900">IC Memo Live Preview</h2>
-          <p className="text-xs text-slate-500">
-            Replicates the official Investment Committee A4 layout. Populate individual sections or generate all applicable sections together from the uploaded Branch Proposal.
-          </p>
+      <div className="bg-white border border-slate-200 rounded-lg p-4 space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          <div>
+            <h2 className="font-display text-lg font-bold text-slate-900">IC Memo Live Preview</h2>
+            <p className="text-xs text-slate-500">
+              Replicates the official Investment Committee A4 layout. Populate individual sections or generate all applicable sections together from the uploaded Branch Proposal.
+            </p>
+          </div>
+
+          <div className="flex items-center gap-2.5 flex-wrap">
+            <button
+              type="button"
+              onClick={() => void onScrutinizeAll()}
+              disabled={!hasBranchProposal || batchScrutiny.running || scrutinizingSection !== null}
+              title={
+                !hasBranchProposal
+                  ? 'Upload the Branch Proposal on Manual Inputs first'
+                  : 'Scrutinize the uploaded Branch Proposal and populate all applicable sections in parallel (preserves manual edits)'
+              }
+              className="inline-flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-white bg-slate-900 hover:bg-slate-800 rounded-lg transition-colors cursor-pointer disabled:opacity-55 whitespace-nowrap shrink-0"
+            >
+              {batchScrutiny.running ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <Sparkles className="w-4 h-4 text-emerald-400" />
+              )}
+              <span>
+                {batchScrutiny.running
+                  ? `Generating (${batchScrutiny.completedSections.length}/${batchScrutiny.total})...`
+                  : 'Generate and Fill Up All Together'}
+              </span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => void onRunCrossVerification()}
+              disabled={crossVerifying || batchScrutiny.running}
+              title="Run arithmetic, cross-document, and AI audit verification across all uploaded documents and memo figures"
+              className="inline-flex items-center gap-2 px-3.5 py-2.5 text-sm font-semibold text-emerald-950 bg-emerald-50 hover:bg-emerald-100 border border-emerald-300 rounded-lg transition-colors cursor-pointer disabled:opacity-55 whitespace-nowrap shrink-0"
+            >
+              {crossVerifying ? (
+                <Loader2 className="w-4 h-4 animate-spin text-emerald-800" />
+              ) : (
+                <ShieldCheck className="w-4 h-4 text-emerald-800" />
+              )}
+              <span>{crossVerifying ? 'Auditing...' : 'Cross-Verify & Audit'}</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={onApplyAllChanges}
+              className={`inline-flex items-center gap-2 px-4 py-2.5 text-sm font-semibold rounded-lg border transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+                hasPendingChanges
+                  ? 'text-amber-950 bg-amber-100 hover:bg-amber-200 border-amber-300'
+                  : 'text-slate-700 bg-slate-100 hover:bg-slate-200 border-slate-300'
+              }`}
+            >
+              <RefreshCw className="w-4 h-4" />
+              <span>Apply All Changes</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={onDownloadDocx}
+              disabled={downloading || downloadingPdf}
+              className="inline-flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-white bg-emerald-800 hover:bg-emerald-900 rounded-lg transition-colors cursor-pointer disabled:opacity-60 whitespace-nowrap shrink-0"
+            >
+              {downloading ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <Download className="w-4 h-4" />
+              )}
+              <span>{downloading ? 'Building .docx...' : 'Download .docx'}</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={onDownloadPdf}
+              disabled={downloading || downloadingPdf}
+              className="inline-flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-white bg-slate-900 hover:bg-slate-800 rounded-lg transition-colors cursor-pointer disabled:opacity-60 whitespace-nowrap shrink-0"
+            >
+              {downloadingPdf ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <Download className="w-4 h-4" />
+              )}
+              <span>{downloadingPdf ? 'Rendering .pdf...' : 'Download .pdf'}</span>
+            </button>
+          </div>
         </div>
 
-        <div className="flex items-center gap-2.5 flex-wrap">
-          <button
-            type="button"
-            onClick={() => void onScrutinizeAll()}
-            disabled={!hasBranchProposal || batchScrutiny.running || scrutinizingSection !== null}
-            title={
-              !hasBranchProposal
-                ? 'Upload the Branch Proposal on Manual Inputs first'
-                : 'Scrutinize the uploaded Branch Proposal and populate all applicable sections in parallel (preserves manual edits)'
-            }
-            className="inline-flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-white bg-slate-900 hover:bg-slate-800 rounded-lg transition-colors cursor-pointer disabled:opacity-55 whitespace-nowrap shrink-0"
-          >
-            {batchScrutiny.running ? (
-              <Loader2 className="w-4 h-4 animate-spin" />
-            ) : (
-              <Sparkles className="w-4 h-4 text-emerald-400" />
-            )}
-            <span>
-              {batchScrutiny.running
-                ? `Generating (${batchScrutiny.completedSections.length}/${batchScrutiny.total})...`
-                : 'Generate and Fill Up All Together'}
+        {/* AI Scrutiny Engine Connection & Model Status Strip (outside final memo document) */}
+        <div className="flex flex-wrap items-center justify-between gap-2 pt-2.5 border-t border-slate-100 text-[11px]">
+          <div className="flex flex-wrap items-center gap-2 text-slate-600">
+            <span
+              className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded font-semibold border ${
+                apiStatus.status === 'ready'
+                  ? 'bg-emerald-50 text-emerald-900 border-emerald-200'
+                  : apiStatus.status === 'cooldown'
+                    ? 'bg-amber-50 text-amber-900 border-amber-200'
+                    : apiStatus.status === 'checking'
+                      ? 'bg-slate-100 text-slate-700 border-slate-200'
+                      : 'bg-red-50 text-red-800 border-red-200'
+              }`}
+            >
+              {apiStatus.status === 'ready' || apiStatus.status === 'checking' ? (
+                <Wifi className="w-3 h-3" />
+              ) : (
+                <WifiOff className="w-3 h-3" />
+              )}
+              <span>
+                {apiStatus.status === 'ready'
+                  ? apiStatus.verified
+                    ? 'Gemini API Connected'
+                    : 'Gemini API Ready'
+                  : apiStatus.status === 'cooldown'
+                    ? 'Quota Cooldown'
+                    : apiStatus.status === 'checking'
+                      ? 'Checking API...'
+                      : apiStatus.status === 'missing_key'
+                        ? 'API Key Not Configured'
+                        : 'API Attention Needed'}
+              </span>
             </span>
-          </button>
-
-          <button
-            type="button"
-            onClick={onApplyAllChanges}
-            className={`inline-flex items-center gap-2 px-4 py-2.5 text-sm font-semibold rounded-lg border transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
-              hasPendingChanges
-                ? 'text-amber-950 bg-amber-100 hover:bg-amber-200 border-amber-300'
-                : 'text-slate-700 bg-slate-100 hover:bg-slate-200 border-slate-300'
-            }`}
-          >
-            <RefreshCw className="w-4 h-4" />
-            <span>Apply All Changes</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={onDownloadDocx}
-            disabled={downloading || downloadingPdf}
-            className="inline-flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-white bg-emerald-800 hover:bg-emerald-900 rounded-lg transition-colors cursor-pointer disabled:opacity-60 whitespace-nowrap shrink-0"
-          >
-            {downloading ? (
-              <Loader2 className="w-4 h-4 animate-spin" />
-            ) : (
-              <Download className="w-4 h-4" />
+            <span className="font-mono text-[10px] text-slate-500">
+              Models: {apiStatus.primaryModel} → {apiStatus.fallbackModel}
+            </span>
+            {apiStatus.verified && typeof apiStatus.latencyMs === 'number' && (
+              <span className="text-emerald-800 font-medium">
+                Verified ({apiStatus.latencyMs}ms)
+              </span>
             )}
-            <span>{downloading ? 'Building .docx...' : 'Download .docx'}</span>
-          </button>
+            {apiStatus.message && apiStatus.status !== 'ready' && (
+              <span className="text-red-700">{apiStatus.message}</span>
+            )}
+          </div>
 
           <button
             type="button"
-            onClick={onDownloadPdf}
-            disabled={downloading || downloadingPdf}
-            className="inline-flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-white bg-slate-900 hover:bg-slate-800 rounded-lg transition-colors cursor-pointer disabled:opacity-60 whitespace-nowrap shrink-0"
+            onClick={() => void onVerifyApi()}
+            disabled={verifyingApi}
+            className="inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 border border-slate-300 rounded cursor-pointer disabled:opacity-60 whitespace-nowrap"
           >
-            {downloadingPdf ? (
-              <Loader2 className="w-4 h-4 animate-spin" />
+            {verifyingApi ? (
+              <Loader2 className="w-3 h-3 animate-spin" />
             ) : (
-              <Download className="w-4 h-4" />
+              <RefreshCw className="w-3 h-3" />
             )}
-            <span>{downloadingPdf ? 'Rendering .pdf...' : 'Download .pdf'}</span>
+            <span>{verifyingApi ? 'Testing Connection...' : 'Verify API'}</span>
           </button>
         </div>
       </div>
@@ -643,7 +757,8 @@ export const ICMemoPreview: React.FC<ICMemoPreviewProps> = ({
         batchScrutiny.total > 0 ||
         batchScrutiny.failedSections.length > 0 ||
         batchScrutiny.insufficientSections.length > 0 ||
-        batchScrutiny.skippedManualSections.length > 0) && (() => {
+        batchScrutiny.skippedManualSections.length > 0 ||
+        Boolean(batchScrutiny.statusMessage)) && (() => {
         const insufficientKeys = new Set(batchScrutiny.insufficientSections.map((i) => i.section));
         const failedKeys = new Set(batchScrutiny.failedSections.map((f) => f.section));
         const cleanlyPopulated = batchScrutiny.completedSections.filter(
@@ -661,7 +776,7 @@ export const ICMemoPreview: React.FC<ICMemoPreviewProps> = ({
             }`}
           >
             <div className="flex items-center justify-between gap-3">
-              <div className="flex items-center gap-2 font-semibold">
+              <div className="flex items-center gap-2 font-semibold flex-wrap">
                 {batchScrutiny.running ? (
                   <Loader2 className="w-4 h-4 animate-spin text-emerald-700 shrink-0" />
                 ) : (
@@ -671,22 +786,33 @@ export const ICMemoPreview: React.FC<ICMemoPreviewProps> = ({
                   {batchScrutiny.running
                     ? `Generating and populating sections in parallel: ${
                         batchScrutiny.completedSections.length + batchScrutiny.failedSections.length
-                      } of ${batchScrutiny.total} processed`
-                    : batchScrutiny.total === 0
-                      ? 'All sections already have manually edited content; nothing was overwritten.'
-                      : `Batch generation finished: ${cleanlyPopulated.length} populated cleanly${
-                          batchScrutiny.failedSections.length > 0
-                            ? `, ${batchScrutiny.failedSections.length} require retry`
-                            : ''
-                        }${
-                          batchScrutiny.insufficientSections.length > 0
-                            ? `, ${batchScrutiny.insufficientSections.length} with unavailable source info`
-                            : ''
-                        }.`}
+                      } of ${batchScrutiny.total} processed${elapsedSec > 0 ? ` (${elapsedSec}s)` : ''}`
+                    : batchScrutiny.statusMessage
+                      ? batchScrutiny.statusMessage
+                      : batchScrutiny.total === 0
+                        ? 'All sections already have manually edited content; nothing was overwritten.'
+                        : `Batch generation finished: ${cleanlyPopulated.length} populated cleanly${
+                            batchScrutiny.failedSections.length > 0
+                              ? `, ${batchScrutiny.failedSections.length} require retry`
+                              : ''
+                          }${
+                            batchScrutiny.insufficientSections.length > 0
+                              ? `, ${batchScrutiny.insufficientSections.length} with unavailable source info`
+                              : ''
+                          }.`}
                 </span>
               </div>
 
-              {!batchScrutiny.running && (
+              {batchScrutiny.running ? (
+                <button
+                  type="button"
+                  onClick={onCancelBatchScrutiny}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-semibold text-red-800 bg-white hover:bg-red-50 border border-red-300 rounded cursor-pointer whitespace-nowrap shrink-0"
+                >
+                  <Square className="w-3 h-3 fill-current" />
+                  <span>Stop</span>
+                </button>
+              ) : (
                 <button
                   type="button"
                   onClick={onDismissBatchSummary}
@@ -697,6 +823,10 @@ export const ICMemoPreview: React.FC<ICMemoPreviewProps> = ({
                 </button>
               )}
             </div>
+
+            {batchScrutiny.running && batchScrutiny.statusMessage && (
+              <p className="text-[11px] text-emerald-900/90">{batchScrutiny.statusMessage}</p>
+            )}
 
             {batchScrutiny.total > 0 && (
               <div className="w-full h-1.5 bg-white/80 border border-emerald-200/70 rounded-full overflow-hidden">
@@ -852,6 +982,119 @@ export const ICMemoPreview: React.FC<ICMemoPreviewProps> = ({
         overrides={overrides}
         onOverrideChange={onOverrideChange}
       />
+
+      {/* Cross-Verification & Discrepancy Detection Report (Outside .ic-memo-sheet so exports stay pure) */}
+      {crossVerificationReport && (
+        <div
+          className={`border rounded-lg p-4 space-y-3 text-xs ${
+            crossVerificationReport.overallStatus === 'discrepancies'
+              ? 'bg-red-50/70 border-red-200'
+              : crossVerificationReport.overallStatus === 'warnings'
+                ? 'bg-amber-50/70 border-amber-200'
+                : 'bg-emerald-50/70 border-emerald-200'
+          }`}
+        >
+          <div className="flex flex-wrap items-start justify-between gap-2">
+            <div className="space-y-0.5">
+              <div className="flex items-center gap-2 flex-wrap">
+                <ShieldCheck
+                  className={`w-4 h-4 shrink-0 ${
+                    crossVerificationReport.overallStatus === 'discrepancies'
+                      ? 'text-red-700'
+                      : crossVerificationReport.overallStatus === 'warnings'
+                        ? 'text-amber-700'
+                        : 'text-emerald-700'
+                  }`}
+                />
+                <h3 className="font-display text-sm font-bold text-slate-900">
+                  Cross-Verification &amp; Discrepancy Audit Report
+                </h3>
+                <span
+                  className={`px-2 py-0.5 rounded font-semibold text-[10px] uppercase ${
+                    crossVerificationReport.overallStatus === 'discrepancies'
+                      ? 'bg-red-100 text-red-900 border border-red-300'
+                      : crossVerificationReport.overallStatus === 'warnings'
+                        ? 'bg-amber-100 text-amber-900 border border-amber-300'
+                        : 'bg-emerald-100 text-emerald-900 border border-emerald-300'
+                  }`}
+                >
+                  {crossVerificationReport.overallStatus === 'discrepancies'
+                    ? 'Discrepancies Found'
+                    : crossVerificationReport.overallStatus === 'warnings'
+                      ? 'Review Warnings'
+                      : 'All Checks Verified'}
+                </span>
+                {crossVerificationReport.usedAi && (
+                  <span className="px-2 py-0.5 rounded bg-slate-900 text-white text-[10px] font-semibold">
+                    AI Audited
+                  </span>
+                )}
+              </div>
+              <p className="text-slate-700 font-medium">{crossVerificationReport.summary}</p>
+            </div>
+            <button
+              type="button"
+              onClick={onDismissCrossVerification}
+              aria-label="Close cross-verification report"
+              className="p-1 text-slate-500 hover:text-slate-800 rounded cursor-pointer"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+
+          {crossVerificationReport.aiCommentary && (
+            <div className="bg-white/90 border border-slate-200 rounded-md p-3 text-slate-800 leading-relaxed">
+              <p className="font-semibold text-[11px] text-slate-900 mb-1">
+                Executive SAMD Audit Commentary:
+              </p>
+              <p>{crossVerificationReport.aiCommentary}</p>
+            </div>
+          )}
+
+          {crossVerificationReport.checks.length > 0 && (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+              {crossVerificationReport.checks.map((chk) => (
+                <div
+                  key={chk.id}
+                  className="bg-white/95 border border-slate-200 rounded-md p-2.5 space-y-1"
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <span className="font-semibold text-slate-900 text-[11px]">{chk.title}</span>
+                    <span
+                      className={`px-1.5 py-0.5 rounded text-[10px] font-semibold shrink-0 uppercase ${
+                        chk.status === 'verified'
+                          ? 'bg-emerald-100 text-emerald-900'
+                          : chk.status === 'discrepancy'
+                            ? 'bg-red-100 text-red-900'
+                            : chk.status === 'warning'
+                              ? 'bg-amber-100 text-amber-900'
+                              : 'bg-slate-100 text-slate-700'
+                      }`}
+                    >
+                      {chk.status}
+                    </span>
+                  </div>
+                  {(chk.expected || chk.actual) && (
+                    <p className="text-[10px] font-mono text-slate-600">
+                      {chk.expected ? `Expected: ${chk.expected}` : ''}
+                      {chk.expected && chk.actual ? ' | ' : ''}
+                      {chk.actual ? `Actual: ${chk.actual}` : ''}
+                    </p>
+                  )}
+                  <p className="text-[11px] text-slate-700 leading-snug">{chk.detail}</p>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {crossVerificationReport.missingInputs.length > 0 && (
+            <div className="bg-white/90 border border-amber-200 rounded-md px-3 py-2 text-[11px] text-amber-950">
+              <span className="font-semibold">Missing Inputs Needed for Full Audit: </span>
+              {crossVerificationReport.missingInputs.join(', ')}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Official Document Paper Sheet (A4 595.32pt proportions) */}
       <div className="bg-slate-200/70 p-4 sm:p-8 rounded-lg overflow-x-auto">

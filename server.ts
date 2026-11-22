@@ -984,9 +984,34 @@ async function runWithConcurrency<T>(
   await Promise.all(runners);
 }
 
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  label: string
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error(`${label} timed out after ${Math.round(timeoutMs / 1000)}s.`));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function isTimeoutError(msg: string): boolean {
+  return /timed?\s*out|ETIMEDOUT|ESOCKETTIMEDOUT|deadline/i.test(msg);
+}
+
 async function executeWithModelFallback<T>(
   runner: (model: SupportedScrutinyModel) => Promise<T>,
-  shouldStop?: () => boolean
+  shouldStop?: () => boolean,
+  timeoutMs = 55_000
 ): Promise<T> {
   const maxPasses = 4;
   let lastErr: unknown;
@@ -1005,7 +1030,7 @@ async function executeWithModelFallback<T>(
       }
       const model = candidates[idx];
       try {
-        const result = await runner(model);
+        const result = await withTimeout(runner(model), timeoutMs, `Gemini request (${model})`);
         modelCooldownUntil.delete(model);
         return result;
       } catch (err) {
@@ -1023,11 +1048,18 @@ async function executeWithModelFallback<T>(
           continue;
         }
 
-        const isTransientNet = /\b(500|502|503|504)\b|timeout|network|econnreset/i.test(msg);
+        const isTransientNet =
+          isTimeoutError(msg) || /\b(500|502|503|504)\b|network|econnreset|fetch failed/i.test(msg);
         if (isTransientNet && !shouldStop?.()) {
-          await new Promise((resolve) => setTimeout(resolve, 250));
+          await new Promise((resolve) => setTimeout(resolve, 350));
           try {
-            return await runner(model);
+            const retried = await withTimeout(
+              runner(model),
+              timeoutMs,
+              `Gemini retry (${model})`
+            );
+            modelCooldownUntil.delete(model);
+            return retried;
           } catch (retryErr) {
             lastErr = retryErr;
             continue;
@@ -1109,11 +1141,22 @@ async function scrutinizeSingleSection(
     }
   }
 
+  // For SAMD synthesis when extracted text + scrutinized sections are already rich, skip redundant multi-page image upload for 3x faster latency
+  const hasEnrichedSamdContext =
+    section === 'samdObservation' &&
+    source.rawText.trim().length >= 500 &&
+    Boolean(
+      context?.justificationLines ||
+        context?.clientPrayer ||
+        context?.branchVisitReport ||
+        context?.sec13BranchRecommendation
+    );
+
   const parts: Array<
     | { inlineData: { mimeType: string; data: string } }
     | { text: string }
   > = [
-    ...source.imageParts,
+    ...(hasEnrichedSamdContext ? [] : source.imageParts),
     {
       text: `${prompt}
 
@@ -1138,7 +1181,8 @@ ${compactContext}`,
           responseSchema: schema,
         }),
       }),
-    shouldStop
+    shouldStop,
+    55_000
   );
 
   const rawJson = stripJsonFences(response.text ?? '{}');
@@ -1403,10 +1447,17 @@ async function startServer() {
       res.flushHeaders?.();
 
       let clientClosed = false;
+      const heartbeatTimer = setInterval(() => {
+        if (!clientClosed && !res.writableEnded) {
+          res.write(': heartbeat\n\n');
+        }
+      }, 8_000);
+
       res.on('close', () => {
         if (!res.writableEnded) {
           clientClosed = true;
         }
+        clearInterval(heartbeatTimer);
       });
 
       const writeEvent = (payload: Record<string, unknown>) => {
@@ -1417,10 +1468,13 @@ async function startServer() {
       const includesSamd = targetSections.includes('samdObservation');
       const independentQueue = targetSections.filter((s) => s !== 'samdObservation');
       const samdContext: Record<string, unknown> = { ...(context ?? {}) };
+      const samdStructuredFindings: Record<string, unknown> = {};
 
       const feedSamdContext = (section: ScrutinySectionKey, result: Record<string, unknown>) => {
         if (section === 'justification' && result.text) {
           samdContext.justificationLines = String(result.text);
+        } else if (section === 'sec1NatureOfBusiness' && result.text) {
+          samdStructuredFindings.natureOfBusiness = String(result.text);
         } else if (section === 'sec8SourceOfRepayment' && result.text) {
           samdContext.sourceOfRepayment = String(result.text);
         } else if (section === 'clientPrayer' && result.text) {
@@ -1431,7 +1485,12 @@ async function startServer() {
           samdContext.sec13BranchRecommendation = String(result.text);
         } else if (section === 'sec14IccdRecommendation' && result.text) {
           samdContext.sec14IccdRecommendation = String(result.text);
+        } else if (!NARRATIVE_SECTION_KEYS.has(section)) {
+          samdStructuredFindings[section] = result.summary
+            ? { summary: result.summary, ...result }
+            : result;
         }
+        samdContext.scrutinizedSections = samdStructuredFindings;
       };
 
       const emitEvaluatedSection = (
@@ -1465,8 +1524,7 @@ async function startServer() {
         }
       }
 
-      // Step 2: Partition uncached sections into 4 balanced streaming groups (+ concurrent SAMD)
-      // Halves multimodal image upload pressure & prevents RPM/TPM burst 429s while streaming every section live.
+      // Step 2: Partition uncached sections into 4 balanced streaming groups, then synthesize SAMD with all verified findings
       const PARALLEL_GROUPS: ScrutinySectionKey[][] = [
         ['justification', 'sec1NatureOfBusiness', 'clientPrayer', 'sec8SourceOfRepayment'],
         ['branchVisit', 'sec13BranchRecommendation', 'sec14IccdRecommendation'],
@@ -1539,40 +1597,44 @@ ${resolved.source.rawText}${contextSuffix}`,
             },
           ];
 
-          const fullBuffer = await executeWithModelFallback(async (model) => {
-            const stream = await ai.models.generateContentStream({
-              model,
-              contents: { parts },
-              config: buildModelConfig(model, {
-                systemInstruction: SCRUTINY_SYSTEM_INSTRUCTION,
-                responseMimeType: 'application/json',
-                responseSchema: schema,
-              }),
-            });
+          const fullBuffer = await executeWithModelFallback(
+            async (model) => {
+              const stream = await ai.models.generateContentStream({
+                model,
+                contents: { parts },
+                config: buildModelConfig(model, {
+                  systemInstruction: SCRUTINY_SYSTEM_INSTRUCTION,
+                  responseMimeType: 'application/json',
+                  responseSchema: schema,
+                }),
+              });
 
-            let acc = '';
-            for await (const chunk of stream) {
-              if (clientClosed) break;
-              const delta = chunk.text ?? '';
-              if (!delta) continue;
-              acc += delta;
+              let acc = '';
+              for await (const chunk of stream) {
+                if (clientClosed) break;
+                const delta = chunk.text ?? '';
+                if (!delta) continue;
+                acc += delta;
 
-              const completed = extractCompletedTopLevelObjects(acc, emittedKeys);
-              for (const item of completed) {
-                const sec = item.key as ScrutinySectionKey;
-                if (!groupSections.includes(sec)) continue;
-                const evaluated = evaluateSectionResult(sec, item.value);
-                const cacheKey = getSectionCacheKey(
-                  resolved.source.sourceId,
-                  sec,
-                  buildCompactSectionContext(sec, context)
-                );
-                storeSectionCache(cacheKey, evaluated);
-                emitEvaluatedSection(sec, evaluated);
+                const completed = extractCompletedTopLevelObjects(acc, emittedKeys);
+                for (const item of completed) {
+                  const sec = item.key as ScrutinySectionKey;
+                  if (!groupSections.includes(sec)) continue;
+                  const evaluated = evaluateSectionResult(sec, item.value);
+                  const cacheKey = getSectionCacheKey(
+                    resolved.source.sourceId,
+                    sec,
+                    buildCompactSectionContext(sec, context)
+                  );
+                  storeSectionCache(cacheKey, evaluated);
+                  emitEvaluatedSection(sec, evaluated);
+                }
               }
-            }
-            return acc;
-          }, () => clientClosed);
+              return acc;
+            },
+            () => clientClosed,
+            75_000
+          );
 
           if (!clientClosed && fullBuffer.trim()) {
             const cleanedBuffer = stripJsonFences(fullBuffer);
@@ -1660,6 +1722,10 @@ ${resolved.source.rawText}${contextSuffix}`,
 
       const runSamdObservation = async (): Promise<void> => {
         if (!includesSamd || clientClosed) return;
+        writeEvent({
+          type: 'status',
+          message: 'Synthesizing Section 15 (SAMD Observation & Recommendation) from verified sections...',
+        });
         const samdCompactCtx = buildCompactSectionContext('samdObservation', samdContext);
         const samdCacheKey = getSectionCacheKey(
           resolved.source.sourceId,
@@ -1691,14 +1757,23 @@ ${resolved.source.rawText}${contextSuffix}`,
         }
       };
 
-      await Promise.all([
-        ...activeGroups.map((group) => runStreamingGroup(group)),
-        runSamdObservation(),
-      ]);
+      try {
+        if (activeGroups.length > 0) {
+          writeEvent({
+            type: 'status',
+            message: `Scrutinizing ${uncachedQueue.length} section(s) across ${activeGroups.length} parallel AI streams...`,
+          });
+          await Promise.all(activeGroups.map((group) => runStreamingGroup(group)));
+        }
 
-      if (!clientClosed) {
-        writeEvent({ type: 'done', sourceId: resolved.source.sourceId });
-        res.end();
+        await runSamdObservation();
+
+        if (!clientClosed) {
+          writeEvent({ type: 'done', sourceId: resolved.source.sourceId });
+          res.end();
+        }
+      } finally {
+        clearInterval(heartbeatTimer);
       }
     } catch (error) {
       if (!(error instanceof MissingApiKeyError)) {
@@ -2380,8 +2455,15 @@ ${source.rawText}`;
       res.flushHeaders?.();
 
       let clientClosed = false;
+      const heartbeatTimer = setInterval(() => {
+        if (!clientClosed && !res.writableEnded) {
+          res.write(': heartbeat\n\n');
+        }
+      }, 8_000);
+
       res.on('close', () => {
         if (!res.writableEnded) clientClosed = true;
+        clearInterval(heartbeatTimer);
       });
 
       const writeEvent = (payload: Record<string, unknown>) => {
@@ -2407,185 +2489,201 @@ ${source.rawText}`;
         }
       }
 
-      if (uncached.length === 1 && !clientClosed) {
-        const sec = uncached[0];
-        try {
-          const ev = await scrutinizeSingleStageSection(
-            ai,
-            sec,
-            source,
-            context,
-            () => clientClosed,
-            contextStr
-          );
+      try {
+        if (uncached.length === 1 && !clientClosed) {
+          const sec = uncached[0];
           writeEvent({
-            type: 'section',
-            section: sec,
-            result: ev.result,
-            insufficient: ev.insufficient,
-            insufficientReason: ev.insufficientReason,
+            type: 'status',
+            message: `Scrutinizing ${docType.toUpperCase()} section with chained IC memo context...`,
           });
-        } catch (err) {
-          if (!clientClosed) {
+          try {
+            const ev = await scrutinizeSingleStageSection(
+              ai,
+              sec,
+              source,
+              context,
+              () => clientClosed,
+              contextStr
+            );
             writeEvent({
-              type: 'error',
+              type: 'section',
               section: sec,
-              error: formatGeminiError(err, 'Failed to generate stage section.'),
+              result: ev.result,
+              insufficient: ev.insufficient,
+              insufficientReason: ev.insufficientReason,
             });
+          } catch (err) {
+            if (!clientClosed) {
+              writeEvent({
+                type: 'error',
+                section: sec,
+                error: formatGeminiError(err, 'Failed to generate stage section.'),
+              });
+            }
           }
-        }
-      } else if (uncached.length > 1 && !clientClosed) {
-        const emittedStageKeys = new Set<string>();
-        let stageBatchError: string | null = null;
-        let hitHardQuota = false;
-
-        const evaluateAndEmitStage = (sec: StageScrutinySectionKey, rawObj: Record<string, unknown>) => {
-          const rawText = String(rawObj.text ?? '').trim();
-          const cleanText = sanitizeAiMemoText(rawText);
-          const modelReason = String(rawObj.insufficientReason ?? '').trim();
-          const insufficient = Boolean(modelReason) || cleanText === '';
-          const evaluated = {
-            result: { text: cleanText, insufficientReason: modelReason },
-            insufficient,
-            insufficientReason:
-              modelReason ||
-              (!cleanText ? 'Required chained memo context or source data is unavailable.' : ''),
-          };
-          const cacheKey = `${source?.sourceId ?? 'ctx_only'}::STAGE::${sec}::${hashString(contextStr)}`;
-          storeSectionCache(cacheKey, evaluated);
+        } else if (uncached.length > 1 && !clientClosed) {
           writeEvent({
-            type: 'section',
-            section: sec,
-            result: evaluated.result,
-            insufficient: evaluated.insufficient,
-            insufficientReason: evaluated.insufficientReason,
+            type: 'status',
+            message: `Scrutinizing ${uncached.length} ${docType.toUpperCase()} sections in parallel stream...`,
           });
-        };
+          const emittedStageKeys = new Set<string>();
+          let stageBatchError: string | null = null;
+          let hitHardQuota = false;
 
-        try {
-          const { prompt, schema } = buildConsolidatedStageBatchSpec(uncached, context);
-          const textPayload = `${prompt}
+          const evaluateAndEmitStage = (sec: StageScrutinySectionKey, rawObj: Record<string, unknown>) => {
+            const rawText = String(rawObj.text ?? '').trim();
+            const cleanText = sanitizeAiMemoText(rawText);
+            const modelReason = String(rawObj.insufficientReason ?? '').trim();
+            const insufficient = Boolean(modelReason) || cleanText === '';
+            const evaluated = {
+              result: { text: cleanText, insufficientReason: modelReason },
+              insufficient,
+              insufficientReason:
+                modelReason ||
+                (!cleanText ? 'Required chained memo context or source data is unavailable.' : ''),
+            };
+            const cacheKey = `${source?.sourceId ?? 'ctx_only'}::STAGE::${sec}::${hashString(contextStr)}`;
+            storeSectionCache(cacheKey, evaluated);
+            writeEvent({
+              type: 'section',
+              section: sec,
+              result: evaluated.result,
+              insufficient: evaluated.insufficient,
+              insufficientReason: evaluated.insufficientReason,
+            });
+          };
+
+          try {
+            const { prompt, schema } = buildConsolidatedStageBatchSpec(uncached, context);
+            const textPayload = `${prompt}
 
 ${source ? `Uploaded Branch Proposal File: ${source.fileName}\nExtracted Text:\n${source.rawText}\n` : ''}
 Chained Memo & Verified Document Context (IC Memo -> MEC Memo -> Board Memo -> Sanction + Stage Inputs):
 ${contextStr}`;
 
-          const icAi = (context?.icMemoAiSections ?? {}) as Record<string, unknown>;
-          const hasPopulatedIc = Boolean(icAi.justification || icAi.samdObservation);
-          const shouldAttachImages =
-            Boolean(source) &&
-            (uncached.includes('sanctionCrossVerifiedSummary') ||
-              !hasPopulatedIc ||
-              (source?.rawText?.trim().length ?? 0) < 500);
+            const icAi = (context?.icMemoAiSections ?? {}) as Record<string, unknown>;
+            const hasPopulatedIc = Boolean(icAi.justification || icAi.samdObservation);
+            const shouldAttachImages =
+              Boolean(source) &&
+              (uncached.includes('sanctionCrossVerifiedSummary') ||
+                !hasPopulatedIc ||
+                (source?.rawText?.trim().length ?? 0) < 500);
 
-          const parts: Array<
-            | { inlineData: { mimeType: string; data: string } }
-            | { text: string }
-          > = shouldAttachImages && source
-            ? [...source.imageParts, { text: textPayload }]
-            : [{ text: textPayload }];
+            const parts: Array<
+              | { inlineData: { mimeType: string; data: string } }
+              | { text: string }
+            > = shouldAttachImages && source
+              ? [...source.imageParts, { text: textPayload }]
+              : [{ text: textPayload }];
 
-          const fullBuffer = await executeWithModelFallback(async (model) => {
-            const stream = await ai.models.generateContentStream({
-              model,
-              contents: { parts },
-              config: buildModelConfig(model, {
-                systemInstruction: SCRUTINY_SYSTEM_INSTRUCTION,
-                responseMimeType: 'application/json',
-                responseSchema: schema,
-              }),
-            });
+            const fullBuffer = await executeWithModelFallback(
+              async (model) => {
+                const stream = await ai.models.generateContentStream({
+                  model,
+                  contents: { parts },
+                  config: buildModelConfig(model, {
+                    systemInstruction: SCRUTINY_SYSTEM_INSTRUCTION,
+                    responseMimeType: 'application/json',
+                    responseSchema: schema,
+                  }),
+                });
 
-            let acc = '';
-            for await (const chunk of stream) {
-              if (clientClosed) break;
-              const delta = chunk.text ?? '';
-              if (!delta) continue;
-              acc += delta;
+                let acc = '';
+                for await (const chunk of stream) {
+                  if (clientClosed) break;
+                  const delta = chunk.text ?? '';
+                  if (!delta) continue;
+                  acc += delta;
 
-              const completed = extractCompletedTopLevelObjects(acc, emittedStageKeys);
-              for (const item of completed) {
+                  const completed = extractCompletedTopLevelObjects(acc, emittedStageKeys);
+                  for (const item of completed) {
+                    const sec = item.key as StageScrutinySectionKey;
+                    if (!uncached.includes(sec)) continue;
+                    evaluateAndEmitStage(sec, item.value);
+                  }
+                }
+                return acc;
+              },
+              () => clientClosed,
+              75_000
+            );
+
+            if (!clientClosed && fullBuffer.trim()) {
+              const cleanedBuffer = stripJsonFences(fullBuffer);
+              const salvaged = extractCompletedTopLevelObjects(cleanedBuffer, emittedStageKeys);
+              for (const item of salvaged) {
                 const sec = item.key as StageScrutinySectionKey;
                 if (!uncached.includes(sec)) continue;
                 evaluateAndEmitStage(sec, item.value);
               }
-            }
-            return acc;
-          }, () => clientClosed);
-
-          if (!clientClosed && fullBuffer.trim()) {
-            const cleanedBuffer = stripJsonFences(fullBuffer);
-            const salvaged = extractCompletedTopLevelObjects(cleanedBuffer, emittedStageKeys);
-            for (const item of salvaged) {
-              const sec = item.key as StageScrutinySectionKey;
-              if (!uncached.includes(sec)) continue;
-              evaluateAndEmitStage(sec, item.value);
-            }
-            try {
-              const finalParsed = JSON.parse(cleanedBuffer) as Record<string, Record<string, unknown>>;
-              for (const sec of uncached) {
-                if (emittedStageKeys.has(sec)) continue;
-                const rawObj = finalParsed[sec];
-                if (rawObj && typeof rawObj === 'object') {
-                  emittedStageKeys.add(sec);
-                  evaluateAndEmitStage(sec, rawObj);
-                }
-              }
-            } catch {
-              // Remaining unemitted sections handled below
-            }
-          }
-        } catch (err) {
-          const rawMsg = err instanceof Error ? err.message : String(err);
-          hitHardQuota = isQuotaOrRateError(rawMsg) && isDailyQuotaError(rawMsg);
-          stageBatchError = formatGeminiError(err, 'Failed to generate stage section.');
-        }
-
-        const remainingStage = uncached.filter((sec) => !emittedStageKeys.has(sec));
-        if (remainingStage.length > 0 && !clientClosed) {
-          if (hitHardQuota && stageBatchError) {
-            for (const sec of remainingStage) {
-              writeEvent({ type: 'error', section: sec, error: stageBatchError });
-            }
-          } else {
-            await runWithConcurrency(remainingStage, 2, async (sec) => {
-              if (clientClosed) return;
               try {
-                const ev = await scrutinizeSingleStageSection(
-                  ai,
-                  sec,
-                  source,
-                  context,
-                  () => clientClosed,
-                  contextStr
-                );
-                writeEvent({
-                  type: 'section',
-                  section: sec,
-                  result: ev.result,
-                  insufficient: ev.insufficient,
-                  insufficientReason: ev.insufficientReason,
-                });
-              } catch (secErr) {
-                if (!clientClosed) {
-                  writeEvent({
-                    type: 'error',
-                    section: sec,
-                    error: formatGeminiError(
-                      secErr,
-                      stageBatchError || 'Failed to generate stage section.'
-                    ),
-                  });
+                const finalParsed = JSON.parse(cleanedBuffer) as Record<string, Record<string, unknown>>;
+                for (const sec of uncached) {
+                  if (emittedStageKeys.has(sec)) continue;
+                  const rawObj = finalParsed[sec];
+                  if (rawObj && typeof rawObj === 'object') {
+                    emittedStageKeys.add(sec);
+                    evaluateAndEmitStage(sec, rawObj);
+                  }
                 }
+              } catch {
+                // Remaining unemitted sections handled below
               }
-            });
+            }
+          } catch (err) {
+            const rawMsg = err instanceof Error ? err.message : String(err);
+            hitHardQuota = isQuotaOrRateError(rawMsg) && isDailyQuotaError(rawMsg);
+            stageBatchError = formatGeminiError(err, 'Failed to generate stage section.');
+          }
+
+          const remainingStage = uncached.filter((sec) => !emittedStageKeys.has(sec));
+          if (remainingStage.length > 0 && !clientClosed) {
+            if (hitHardQuota && stageBatchError) {
+              for (const sec of remainingStage) {
+                writeEvent({ type: 'error', section: sec, error: stageBatchError });
+              }
+            } else {
+              await runWithConcurrency(remainingStage, 2, async (sec) => {
+                if (clientClosed) return;
+                try {
+                  const ev = await scrutinizeSingleStageSection(
+                    ai,
+                    sec,
+                    source,
+                    context,
+                    () => clientClosed,
+                    contextStr
+                  );
+                  writeEvent({
+                    type: 'section',
+                    section: sec,
+                    result: ev.result,
+                    insufficient: ev.insufficient,
+                    insufficientReason: ev.insufficientReason,
+                  });
+                } catch (secErr) {
+                  if (!clientClosed) {
+                    writeEvent({
+                      type: 'error',
+                      section: sec,
+                      error: formatGeminiError(
+                        secErr,
+                        stageBatchError || 'Failed to generate stage section.'
+                      ),
+                    });
+                  }
+                }
+              });
+            }
           }
         }
-      }
 
-      if (!clientClosed) {
-        writeEvent({ type: 'done', sourceId: source?.sourceId });
-        res.end();
+        if (!clientClosed) {
+          writeEvent({ type: 'done', sourceId: source?.sourceId });
+          res.end();
+        }
+      } finally {
+        clearInterval(heartbeatTimer);
       }
     } catch (error) {
       if (!(error instanceof MissingApiKeyError)) {
@@ -2678,6 +2776,501 @@ ${JSON.stringify(context, null, 2)}`;
     }
   });
 
+  // API status & connectivity endpoints (never expose key values)
+  app.get('/api/gemini/status', (_req, res) => {
+    const apiKey = (process.env.GEMINI_API_KEY || process.env.API_KEY || '').trim();
+    const now = Date.now();
+    const models = FREE_TIER_MODELS.map((model) => {
+      const until = modelCooldownUntil.get(model) ?? 0;
+      const remainingSec = until > now ? Math.ceil((until - now) / 1000) : 0;
+      return {
+        model,
+        available: remainingSec === 0,
+        cooldownRemainingSec: remainingSec,
+      };
+    });
+
+    if (!apiKey) {
+      res.json({
+        configured: false,
+        status: 'missing_key',
+        primaryModel: FREE_TIER_MODELS[0],
+        fallbackModel: FREE_TIER_MODELS[1],
+        models,
+        cachedSources: branchProposalCache.size,
+        cachedResults: sectionResultCache.size,
+        message: MISSING_API_KEY_MESSAGE,
+      });
+      return;
+    }
+
+    const anyAvailable = models.some((m) => m.available);
+    const maxCooldown = Math.max(...models.map((m) => m.cooldownRemainingSec));
+    res.json({
+      configured: true,
+      status: anyAvailable ? 'ready' : 'cooldown',
+      primaryModel: FREE_TIER_MODELS[0],
+      fallbackModel: FREE_TIER_MODELS[1],
+      models,
+      cachedSources: branchProposalCache.size,
+      cachedResults: sectionResultCache.size,
+      message: anyAvailable
+        ? 'Gemini AI Scrutiny API configured and ready.'
+        : `All models in temporary quota cooldown (~${maxCooldown}s remaining).`,
+    });
+  });
+
+  app.post('/api/gemini/verify', async (_req, res) => {
+    const started = Date.now();
+    const aiClient = resolveAiClient();
+    const now = Date.now();
+    const buildModelsSnapshot = () =>
+      FREE_TIER_MODELS.map((model) => {
+        const until = modelCooldownUntil.get(model) ?? 0;
+        const remainingSec = until > now ? Math.ceil((until - now) / 1000) : 0;
+        return {
+          model,
+          available: remainingSec === 0,
+          cooldownRemainingSec: remainingSec,
+        };
+      });
+
+    if (!aiClient.ok) {
+      res.status(aiClient.status).json({
+        ok: false,
+        configured: false,
+        status: 'missing_key',
+        primaryModel: FREE_TIER_MODELS[0],
+        fallbackModel: FREE_TIER_MODELS[1],
+        models: buildModelsSnapshot(),
+        cachedSources: branchProposalCache.size,
+        cachedResults: sectionResultCache.size,
+        message: aiClient.error,
+      });
+      return;
+    }
+
+    let usedModel: SupportedScrutinyModel = FREE_TIER_MODELS[0];
+    try {
+      await executeWithModelFallback(
+        async (model) => {
+          usedModel = model;
+          return aiClient.ai.models.generateContent({
+            model,
+            contents: 'Reply with OK.',
+            config: buildModelConfig(model, {}),
+          });
+        },
+        undefined,
+        15_000
+      );
+
+      const latencyMs = Date.now() - started;
+      res.json({
+        ok: true,
+        configured: true,
+        status: 'ready',
+        verified: true,
+        model: usedModel,
+        primaryModel: FREE_TIER_MODELS[0],
+        fallbackModel: FREE_TIER_MODELS[1],
+        models: buildModelsSnapshot(),
+        cachedSources: branchProposalCache.size,
+        cachedResults: sectionResultCache.size,
+        latencyMs,
+        lastCheckedAt: new Date().toISOString(),
+        message: `Connected to ${usedModel} (${latencyMs}ms)`,
+      });
+    } catch (error) {
+      const latencyMs = Date.now() - started;
+      const msg = formatGeminiError(error, 'Gemini API connectivity test failed.');
+      const isCooldown = /quota|rate\s*limit/i.test(msg);
+      res.status(502).json({
+        ok: false,
+        configured: true,
+        status: isCooldown ? 'cooldown' : 'error',
+        verified: false,
+        primaryModel: FREE_TIER_MODELS[0],
+        fallbackModel: FREE_TIER_MODELS[1],
+        models: buildModelsSnapshot(),
+        cachedSources: branchProposalCache.size,
+        cachedResults: sectionResultCache.size,
+        latencyMs,
+        lastCheckedAt: new Date().toISOString(),
+        message: msg,
+      });
+    }
+  });
+
+  // Cross-Verification & Discrepancy Detection Report across all 7 banking input documents + AI sections
+  app.post('/api/gemini/cross-verify', async (req, res) => {
+    try {
+      const {
+        placeholders,
+        extractedDocs,
+        manualInputs,
+        aiSections,
+        sourceId,
+        branchProposalSource,
+      } = req.body as {
+        placeholders?: Record<string, string>;
+        extractedDocs?: Record<string, unknown>;
+        manualInputs?: Record<string, string>;
+        aiSections?: Record<string, unknown>;
+        sourceId?: string;
+        branchProposalSource?: IncomingBranchProposalSource | null;
+      };
+
+      const ph = placeholders ?? {};
+      const parseNum = (raw: string | undefined): number | null => {
+        if (!raw) return null;
+        const cleaned = String(raw).replace(/,/g, '').replace(/[^\d.-]/g, '').trim();
+        if (!cleaned) return null;
+        const n = Number(cleaned);
+        return Number.isFinite(n) ? n : null;
+      };
+      const fmt2 = (n: number): string => n.toFixed(2);
+
+      type CheckItem = {
+        id: string;
+        category: 'arithmetic' | 'cross_document' | 'policy' | 'completeness';
+        title: string;
+        status: 'verified' | 'discrepancy' | 'warning' | 'missing';
+        expected?: string;
+        actual?: string;
+        detail: string;
+      };
+
+      const checks: CheckItem[] = [];
+      const missingInputs: string[] = [];
+
+      const n4 = parseNum(ph['#4#']);
+      const n7 = parseNum(ph['#7#']);
+      const n8 = parseNum(ph['#8#']);
+      const n10 = parseNum(ph['#10#']);
+      const n11 = parseNum(ph['#11#']);
+      const n12 = parseNum(ph['#12#']);
+      const n25 = parseNum(ph['#25#']);
+      const n27 = parseNum(ph['#27#']);
+      const n31 = parseNum(ph['#31#']);
+      const n32 = parseNum(ph['#32#']);
+      const n35 = parseNum(ph['#35#']);
+      const n42 = parseNum(ph['#42#']);
+      const n44 = parseNum(ph['#44#']);
+
+      // 1. Outstanding Breakup vs NET Outstanding
+      if (n7 !== null && n8 !== null && n10 !== null && n11 !== null && n25 !== null) {
+        const sumApplied = n7 + n8 + n10 + n11;
+        const sumWithComp = sumApplied + (n12 ?? 0);
+        const diffApplied = Math.abs(sumApplied - n25);
+        const diffWithComp = Math.abs(sumWithComp - n25);
+        const useWithComp = n12 !== null && diffWithComp < diffApplied;
+        const bestExpected = useWithComp ? sumWithComp : sumApplied;
+        const diff = Math.min(diffApplied, diffWithComp);
+        checks.push({
+          id: 'net_outstanding_reconcile',
+          category: 'arithmetic',
+          title: 'NET Outstanding Reconciliation (#7# + #8# + #10# + #11# vs #25#)',
+          status: diff <= 0.03 ? 'verified' : 'discrepancy',
+          expected: `${fmt2(bestExpected)} M`,
+          actual: `${fmt2(n25)} M`,
+          detail:
+            diff <= 0.03
+              ? 'NET Outstanding matches the sum of Principal, Charges, Charged Profit, and Compensation within rounding tolerance.'
+              : `NET Outstanding (#25# = ${fmt2(n25)}M) differs from breakup sum (${fmt2(bestExpected)}M) by ${fmt2(diff)}M.`,
+        });
+      } else {
+        missingInputs.push('Outstanding breakup (#7#, #8#, #10#, #11#, #25#)');
+      }
+
+      // 2. Breakup Total vs Cost of Fund Breakup (#32#)
+      if (n7 !== null && n8 !== null && n31 !== null && n32 !== null) {
+        const expected32 = n7 + n8 + n31;
+        const diff = Math.abs(expected32 - n32);
+        checks.push({
+          id: 'cof_breakup_32',
+          category: 'arithmetic',
+          title: 'COF Breakup Total (#7# + #8# + #31# = #32#)',
+          status: diff <= 0.02 ? 'verified' : 'discrepancy',
+          expected: `${fmt2(expected32)} M`,
+          actual: `${fmt2(n32)} M`,
+          detail:
+            diff <= 0.02
+              ? 'Breakup Total (#32#) accurately equals Principal + Charges + Cost of Fund.'
+              : `Breakup Total (#32# = ${fmt2(n32)}M) does not match #7# + #8# + #31# (${fmt2(expected32)}M).`,
+        });
+      } else {
+        missingInputs.push('Cost of Fund Breakup (#31#, #32#)');
+      }
+
+      // 3. Max Permissible Waiver (#44# = #42# - #31#)
+      if (n42 !== null && n31 !== null && n44 !== null) {
+        const expected44 = n42 - n31;
+        const diff = Math.abs(expected44 - n44);
+        checks.push({
+          id: 'max_waiver_44',
+          category: 'arithmetic',
+          title: 'Max Permissible Waiver (#42# - #31# = #44#)',
+          status: diff <= 0.02 ? 'verified' : 'discrepancy',
+          expected: `${fmt2(expected44)} M`,
+          actual: `${fmt2(n44)} M`,
+          detail:
+            diff <= 0.02
+              ? 'Maximum Permissible Waiver (#44#) matches (#42# - #31#).'
+              : `Max Waiver (#44# = ${fmt2(n44)}M) differs from (#42# - #31# = ${fmt2(expected44)}M).`,
+        });
+      }
+
+      // 4. Policy Check: Proposed Waiver (#4#) vs Max Permissible Waiver (#44#)
+      if (n4 !== null && n44 !== null) {
+        checks.push({
+          id: 'policy_waiver_cap',
+          category: 'policy',
+          title: 'Proposed Waiver (#4#) vs Maximum Permissible Waiver (#44#)',
+          status: n4 <= n44 + 0.01 ? 'verified' : 'warning',
+          expected: `<= ${fmt2(n44)} M`,
+          actual: `${fmt2(n4)} M`,
+          detail:
+            n4 <= n44 + 0.01
+              ? `Proposed waiver of Tk. ${fmt2(n4)}M is within the maximum permissible Cost of Fund waiver limit (Tk. ${fmt2(n44)}M).`
+              : `Proposed waiver of Tk. ${fmt2(n4)}M exceeds the Cost of Fund permissible ceiling of Tk. ${fmt2(n44)}M by Tk. ${fmt2(n4 - n44)}M.`,
+        });
+      } else {
+        missingInputs.push('Proposed Waiver (#4#) or Max Permissible Waiver (#44#)');
+      }
+
+      // 5. Policy Check: Settlement Amount (#27#) vs Principal + Charges + COF (#32#)
+      if (n27 !== null && n32 !== null) {
+        checks.push({
+          id: 'policy_settlement_cof',
+          category: 'policy',
+          title: 'Settlement Recovery (#27#) vs COF Recovery Floor (#32#)',
+          status: n27 + 0.01 >= n32 ? 'verified' : 'warning',
+          expected: `>= ${fmt2(n32)} M`,
+          actual: `${fmt2(n27)} M`,
+          detail:
+            n27 + 0.01 >= n32
+              ? `Settlement/Exit amount (Tk. ${fmt2(n27)}M) fully covers Principal + Charges + Cost of Fund (Tk. ${fmt2(n32)}M).`
+              : `Settlement amount (Tk. ${fmt2(n27)}M) is below Cost of Fund Breakup Total (Tk. ${fmt2(n32)}M) by Tk. ${fmt2(n32 - n27)}M.`,
+        });
+      } else {
+        missingInputs.push('Settlement Amount (#27#)');
+      }
+
+      // 6. Settlement + Waiver vs NET Outstanding (informational check)
+      if (n27 !== null && n4 !== null && n25 !== null) {
+        const combined = n27 + n4;
+        const diff = Math.abs(combined - n25);
+        checks.push({
+          id: 'settlement_plus_waiver',
+          category: 'arithmetic',
+          title: 'Settlement (#27#) + Proposed Waiver (#4#) vs NET Outstanding (#25#)',
+          status: diff <= 0.05 ? 'verified' : 'warning',
+          expected: `${fmt2(n25)} M`,
+          actual: `${fmt2(combined)} M`,
+          detail:
+            diff <= 0.05
+              ? 'Settlement amount plus proposed waiver aligns with NET Outstanding (#25#).'
+              : `Settlement (${fmt2(n27)}M) + Waiver (${fmt2(n4)}M) = ${fmt2(combined)}M vs NET Outstanding ${fmt2(n25)}M (difference of ${fmt2(diff)}M may reflect unapplied/accruing profit).`,
+        });
+      }
+
+      // 7. Down Payment (#35#) vs Settlement Amount (#27#)
+      if (n35 !== null && n27 !== null && n27 > 0) {
+        const dpPct = (n35 / n27) * 100;
+        checks.push({
+          id: 'down_payment_ratio',
+          category: 'policy',
+          title: 'Down Payment (#35#) Coverage of Settlement Amount (#27#)',
+          status: n35 > 0 ? 'verified' : 'warning',
+          expected: '> 0.00 M',
+          actual: `${fmt2(n35)} M (${dpPct.toFixed(1)}%)`,
+          detail:
+            n35 > 0
+              ? `Down payment of Tk. ${fmt2(n35)}M deposited (${dpPct.toFixed(1)}% of settlement amount).`
+              : 'Down payment balance (#35#) is zero or not detected from Account Statement.',
+        });
+      }
+
+      // 8. Cross-Document Consistency: Branch Proposal vs System Reports
+      const bp = (extractedDocs?.branchProposal ?? null) as Record<string, unknown> | null;
+      if (bp) {
+        const bpAc = String(bp.accountNo ?? '').trim();
+        const sysAc = String(ph['#2#'] ?? '').trim();
+        if (bpAc && sysAc) {
+          const norm = (s: string) => s.replace(/[^a-z0-9]/gi, '').toLowerCase();
+          const match = norm(bpAc).includes(norm(sysAc)) || norm(sysAc).includes(norm(bpAc));
+          checks.push({
+            id: 'cross_doc_account',
+            category: 'cross_document',
+            title: 'Account Reference: Branch Proposal vs Account Statement (#2#)',
+            status: match ? 'verified' : 'warning',
+            expected: sysAc,
+            actual: bpAc,
+            detail: match
+              ? 'Account number/title matches across Branch Proposal and Account Statement.'
+              : `Branch Proposal account ("${bpAc}") differs from Account Statement ("${sysAc}").`,
+          });
+        }
+        const bpCib = String(bp.section4CibDate ?? '').trim();
+        const sysCib = String(ph['#62#'] ?? '').trim();
+        if (bpCib && sysCib) {
+          const same = bpCib.replace(/[./-]/g, '') === sysCib.replace(/[./-]/g, '');
+          checks.push({
+            id: 'cross_doc_cib_date',
+            category: 'cross_document',
+            title: 'CIB Inquiry Date: Branch Proposal vs CIB Report (#62#)',
+            status: same ? 'verified' : 'warning',
+            expected: sysCib,
+            actual: bpCib,
+            detail: same
+              ? `CIB Inquiry Date (${sysCib}) matches across CIB Report and Branch Proposal.`
+              : `CIB Report date (${sysCib}) differs from Branch Proposal Section 4 date (${bpCib}).`,
+          });
+        }
+      }
+
+      // Optional Gemini AI Deep Cross-Verification Commentary
+      let aiCommentary = '';
+      let usedAi = false;
+      const aiClient = resolveAiClient();
+      const resolvedSource =
+        sourceId || branchProposalSource
+          ? resolveBranchProposalSource(sourceId, branchProposalSource)
+          : null;
+
+      if (aiClient.ok) {
+        try {
+          const crossSchema: Schema = {
+            type: Type.OBJECT,
+            properties: {
+              commentary: strField(
+                'Concise 3-5 sentence executive SAMD audit commentary cross-verifying all 7 documents, highlighting verified consistency, any numeric/policy discrepancies, and any missing items.'
+              ),
+              additionalFindings: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    title: strField('Short check title'),
+                    status: strField('One of: verified, discrepancy, warning, missing'),
+                    detail: strField('1-sentence factual finding'),
+                  },
+                  required: ['title', 'status', 'detail'],
+                },
+              },
+            },
+            required: ['commentary', 'additionalFindings'],
+          };
+
+          const bpSnippet =
+            resolvedSource && resolvedSource.ok
+              ? resolvedSource.source.rawText.slice(0, 18_000)
+              : '';
+
+          const prompt = `Perform a high-speed Senior SAMD Credit Audit & Cross-Verification across all uploaded banking inputs, calculated IC Memo placeholders, manual inputs, and scrutinized sections.
+Automated Checks Already Run:
+${JSON.stringify(checks, null, 2)}
+
+Resolved Placeholders (Million BDT):
+${JSON.stringify(ph)}
+
+Manual Inputs:
+${JSON.stringify(manualInputs ?? {})}
+
+Scrutinized AI Sections Snapshot:
+${JSON.stringify(aiSections ?? {})}
+
+${bpSnippet ? `Branch Proposal Excerpt:\n${bpSnippet}` : ''}
+
+Provide:
+1. "commentary": A crisp 3-5 sentence audit summary confirming what reconciles cleanly and flagging any critical discrepancies, waiver/COF concerns, or missing documents.
+2. "additionalFindings": Up to 4 additional cross-document or policy checks not already covered above (e.g., Security coverage vs Exposure, CIB/Classification consistency, Legal/Audit compliance readiness, Branch vs HO waiver alignment).`;
+
+          const aiResp = await executeWithModelFallback(
+            (model) =>
+              aiClient.ai.models.generateContent({
+                model,
+                contents: prompt,
+                config: buildModelConfig(model, {
+                  systemInstruction:
+                    'You are a Senior Credit Audit Officer at SAMD, Head Office, Sammilito Islami Bank PLC. Be strictly factual, concise, and never invent figures.',
+                  responseMimeType: 'application/json',
+                  responseSchema: crossSchema,
+                }),
+              }),
+            undefined,
+            30_000
+          );
+
+          const parsed = JSON.parse(stripJsonFences(aiResp.text ?? '{}') || '{}') as {
+            commentary?: string;
+            additionalFindings?: Array<{ title?: string; status?: string; detail?: string }>;
+          };
+          aiCommentary = sanitizeAiMemoText(String(parsed.commentary ?? ''));
+          if (Array.isArray(parsed.additionalFindings)) {
+            parsed.additionalFindings.slice(0, 4).forEach((item, idx) => {
+              const title = String(item?.title ?? '').trim();
+              const detail = String(item?.detail ?? '').trim();
+              const rawStatus = String(item?.status ?? 'warning').toLowerCase();
+              const status: CheckItem['status'] =
+                rawStatus === 'verified' ||
+                rawStatus === 'discrepancy' ||
+                rawStatus === 'warning' ||
+                rawStatus === 'missing'
+                  ? rawStatus
+                  : 'warning';
+              if (title && detail) {
+                checks.push({
+                  id: `ai_check_${idx}`,
+                  category: 'cross_document',
+                  title,
+                  status,
+                  detail,
+                });
+              }
+            });
+          }
+          usedAi = true;
+        } catch (aiErr) {
+          aiCommentary = `Deterministic checks completed. AI audit commentary unavailable: ${formatGeminiError(aiErr, 'API error')}`;
+        }
+      } else {
+        aiCommentary = `Deterministic cross-checks completed. (${aiClient.error})`;
+      }
+
+      const hasDiscrepancy = checks.some((c) => c.status === 'discrepancy');
+      const hasWarning = checks.some((c) => c.status === 'warning') || missingInputs.length > 0;
+      const overallStatus = hasDiscrepancy
+        ? 'discrepancies'
+        : hasWarning
+          ? 'warnings'
+          : 'verified';
+
+      const verifiedCount = checks.filter((c) => c.status === 'verified').length;
+      const issueCount = checks.filter(
+        (c) => c.status === 'discrepancy' || c.status === 'warning'
+      ).length;
+
+      res.json({
+        report: {
+          generatedAt: new Date().toISOString(),
+          overallStatus,
+          summary: `${verifiedCount} verified check(s), ${issueCount} discrepancy/warning item(s), ${missingInputs.length} missing input group(s).`,
+          checks,
+          aiCommentary,
+          missingInputs,
+          usedAi,
+        },
+      });
+    } catch (error) {
+      console.error('Error during cross-verification:', error);
+      res.status(500).json({
+        error: formatGeminiError(error, 'Failed to run cross-verification audit.'),
+      });
+    }
+  });
+
   // Guarantee /api/* requests never fall through to Vite/SPA HTML fallback or Express HTML error pages
   app.use('/api', (_req, res) => {
     res.status(404).json({ error: 'API endpoint not found.' });
@@ -2716,6 +3309,8 @@ ${JSON.stringify(context, null, 2)}`;
   );
 
   const httpServer = http.createServer(app);
+  httpServer.requestTimeout = 180_000;
+  httpServer.headersTimeout = 60_000;
 
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');

@@ -1,5 +1,7 @@
 import type {
   AiSectionsData,
+  BranchProposalSource,
+  CrossVerificationReport,
   DocumentKey,
   DocumentUploadMeta,
   ExtractedDocumentsState,
@@ -30,6 +32,9 @@ export interface PersistedCaseState {
   stageManualEditedSections?: Partial<Record<StageScrutinySectionKey, boolean>>;
   docUploadedFlags?: Partial<Record<DocumentKey, { uploaded: boolean; fileName: string }>>;
   stageSourceUploads?: Partial<Record<StageMemoDocType, StageSourceUploadState>>;
+  branchProposalSource?: BranchProposalSource | null;
+  stageSources?: Partial<Record<StageMemoDocType, BranchProposalSource>>;
+  crossVerificationReport?: CrossVerificationReport | null;
 }
 
 function openCaseDb(): Promise<IDBDatabase> {
@@ -48,6 +53,16 @@ function openCaseDb(): Promise<IDBDatabase> {
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error || new Error('Failed to open case storage.'));
   });
+}
+
+function stripImagesForLocalStorage(
+  src: BranchProposalSource | null | undefined
+): BranchProposalSource | null | undefined {
+  if (!src) return src;
+  return {
+    ...src,
+    pageImages: [],
+  };
 }
 
 export async function saveCentralCaseState(
@@ -77,6 +92,9 @@ export async function saveCentralCaseState(
     stageManualEditedSections: state.stageManualEditedSections,
     docUploadedFlags,
     stageSourceUploads: state.stageSourceUploads,
+    branchProposalSource: state.branchProposalSource ?? null,
+    stageSources: state.stageSources ?? {},
+    crossVerificationReport: state.crossVerificationReport ?? null,
   };
 
   try {
@@ -91,7 +109,21 @@ export async function saveCentralCaseState(
   } catch {
     try {
       if (typeof localStorage !== 'undefined') {
-        localStorage.setItem(DB_NAME, JSON.stringify(record));
+        const compactStageSources: Partial<Record<StageMemoDocType, BranchProposalSource>> = {};
+        if (record.stageSources) {
+          for (const [k, v] of Object.entries(record.stageSources) as Array<
+            [StageMemoDocType, BranchProposalSource]
+          >) {
+            const stripped = stripImagesForLocalStorage(v);
+            if (stripped) compactStageSources[k] = stripped;
+          }
+        }
+        const compactRecord: PersistedCaseState = {
+          ...record,
+          branchProposalSource: stripImagesForLocalStorage(record.branchProposalSource),
+          stageSources: compactStageSources,
+        };
+        localStorage.setItem(DB_NAME, JSON.stringify(compactRecord));
       }
     } catch {
       // Ignore storage quota / blocked environment errors

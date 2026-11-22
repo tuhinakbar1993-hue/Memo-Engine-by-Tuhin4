@@ -274,6 +274,8 @@ export interface BatchScrutinyState {
   failedSections: Array<{ section: ScrutinySectionKey; error: string }>;
   insufficientSections: InsufficientSectionInfo[];
   skippedManualSections: ScrutinySectionKey[];
+  statusMessage?: string | null;
+  startedAt?: number | null;
 }
 
 export interface Section2AiData {
@@ -420,6 +422,8 @@ export interface StageBatchScrutinyState {
   failedSections: Array<{ section: StageScrutinySectionKey; error: string }>;
   insufficientSections: Array<{ section: StageScrutinySectionKey; reason: string }>;
   skippedManualSections: StageScrutinySectionKey[];
+  statusMessage?: string | null;
+  startedAt?: number | null;
 }
 
 export interface ResolvedStageMemo {
@@ -479,3 +483,44 @@ export interface StageSourceUploadState {
   extractedFieldCount: number;
   audit: StageSourceAuditResult | null;
 }
+
+export interface ApiModelStatus {
+  model: string;
+  available: boolean;
+  cooldownRemainingSec: number;
+}
+
+export interface ApiStatusInfo {
+  configured: boolean;
+  status: 'checking' | 'ready' | 'missing_key' | 'cooldown' | 'error';
+  primaryModel: string;
+  fallbackModel: string;
+  models: ApiModelStatus[];
+  cachedSources: number;
+  cachedResults: number;
+  verified?: boolean;
+  latencyMs?: number;
+  lastCheckedAt?: string;
+  message?: string;
+}
+
+export interface CrossVerificationCheck {
+  id: string;
+  category: 'arithmetic' | 'cross_document' | 'policy' | 'completeness';
+  title: string;
+  status: 'verified' | 'discrepancy' | 'warning' | 'missing';
+  expected?: string;
+  actual?: string;
+  detail: string;
+}
+
+export interface CrossVerificationReport {
+  generatedAt: string;
+  overallStatus: 'verified' | 'warnings' | 'discrepancies';
+  summary: string;
+  checks: CrossVerificationCheck[];
+  aiCommentary: string;
+  missingInputs: string[];
+  usedAi: boolean;
+}
+

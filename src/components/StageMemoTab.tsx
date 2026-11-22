@@ -11,7 +11,11 @@ import {
   RefreshCw,
   RotateCcw,
   Sparkles,
+  Square,
   Trash2,
+  Wifi,
+  WifiOff,
+  X,
 } from 'lucide-react';
 import {
   STAGE_SECTION_LABELS,
@@ -19,6 +23,7 @@ import {
 } from '../engines/icMemoEngine';
 import { renderTemplatePreviewBlocks } from '../exporters/docxTemplateEngine';
 import type {
+  ApiStatusInfo,
   MemoDocType,
   MemoTemplateRecord,
   ResolvedStageMemo,
@@ -46,6 +51,9 @@ interface StageMemoTabProps {
   onUploadStageSource: (docType: StageMemoDocType, file: File) => Promise<void>;
   onClearStageSource: (docType: StageMemoDocType) => void;
   aiError: string | null;
+  apiStatus: ApiStatusInfo;
+  verifyingApi: boolean;
+  onVerifyApi: () => Promise<void>;
   onStageInputChange: (field: keyof StageMemoInputs, value: string) => void;
   onUpdateStageAiSection: (
     section: StageScrutinySectionKey,
@@ -62,6 +70,7 @@ interface StageMemoTabProps {
     section: StageScrutinySectionKey
   ) => Promise<void>;
   onScrutinizeStageAll: (docType: StageMemoDocType) => Promise<void>;
+  onCancelStageBatchScrutiny: () => void;
   onDismissStageBatchSummary: () => void;
   templates: Record<MemoDocType, MemoTemplateRecord | null>;
   onUploadTemplate: (docType: MemoDocType, file: File) => Promise<void>;
@@ -157,11 +166,15 @@ export const StageMemoTab: React.FC<StageMemoTabProps> = ({
   onUploadStageSource,
   onClearStageSource,
   aiError,
+  apiStatus,
+  verifyingApi,
+  onVerifyApi,
   onStageInputChange,
   onUpdateStageAiSection,
   onScrutinizeStageSection,
   onRetryStageSection,
   onScrutinizeStageAll,
+  onCancelStageBatchScrutiny,
   onDismissStageBatchSummary,
   templates,
   onUploadTemplate,
@@ -187,6 +200,7 @@ export const StageMemoTab: React.FC<StageMemoTabProps> = ({
   const [confirmOverwriteSection, setConfirmOverwriteSection] =
     useState<StageScrutinySectionKey | null>(null);
   const [isDraggingStageSource, setIsDraggingStageSource] = useState(false);
+  const [elapsedSec, setElapsedSec] = useState(0);
 
   const stageUploadConfig =
     docType === 'mec'
@@ -221,7 +235,23 @@ export const StageMemoTab: React.FC<StageMemoTabProps> = ({
     stageBatchScrutiny.running && stageBatchScrutiny.docType === docType;
   const isAnyBatchRunning = stageBatchScrutiny.running;
   const showBatchPanel =
-    stageBatchScrutiny.docType === docType && stageBatchScrutiny.total > 0;
+    stageBatchScrutiny.docType === docType &&
+    (stageBatchScrutiny.total > 0 || Boolean(stageBatchScrutiny.statusMessage));
+
+  useEffect(() => {
+    if (!isThisDocBatchRunning || !stageBatchScrutiny.startedAt) {
+      setElapsedSec(0);
+      return;
+    }
+    const updateElapsed = () => {
+      setElapsedSec(
+        Math.max(0, Math.floor((Date.now() - (stageBatchScrutiny.startedAt ?? Date.now())) / 1000))
+      );
+    };
+    updateElapsed();
+    const timer = window.setInterval(updateElapsed, 1000);
+    return () => window.clearInterval(timer);
+  }, [isThisDocBatchRunning, stageBatchScrutiny.startedAt]);
 
   const toggleEdit = (key: StageScrutinySectionKey) => {
     setEditingSections((prev) => ({ ...prev, [key]: !prev[key] }));
@@ -488,6 +518,64 @@ export const StageMemoTab: React.FC<StageMemoTabProps> = ({
             </span>
           )}
         </div>
+
+        {/* AI Scrutiny Engine Connection Strip */}
+        <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-100 text-[11px]">
+          <div className="flex flex-wrap items-center gap-2 text-slate-600">
+            <span
+              className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded font-semibold border ${
+                apiStatus.status === 'ready'
+                  ? 'bg-emerald-50 text-emerald-900 border-emerald-200'
+                  : apiStatus.status === 'cooldown'
+                    ? 'bg-amber-50 text-amber-900 border-amber-200'
+                    : apiStatus.status === 'checking'
+                      ? 'bg-slate-100 text-slate-700 border-slate-200'
+                      : 'bg-red-50 text-red-800 border-red-200'
+              }`}
+            >
+              {apiStatus.status === 'ready' || apiStatus.status === 'checking' ? (
+                <Wifi className="w-3 h-3" />
+              ) : (
+                <WifiOff className="w-3 h-3" />
+              )}
+              <span>
+                {apiStatus.status === 'ready'
+                  ? apiStatus.verified
+                    ? 'Gemini API Connected'
+                    : 'Gemini API Ready'
+                  : apiStatus.status === 'cooldown'
+                    ? 'Quota Cooldown'
+                    : apiStatus.status === 'checking'
+                      ? 'Checking API...'
+                      : apiStatus.status === 'missing_key'
+                        ? 'API Key Not Configured'
+                        : 'API Attention Needed'}
+              </span>
+            </span>
+            <span className="font-mono text-[10px] text-slate-500">
+              {apiStatus.primaryModel} → {apiStatus.fallbackModel}
+            </span>
+            {apiStatus.verified && typeof apiStatus.latencyMs === 'number' && (
+              <span className="text-emerald-800 font-medium">
+                Verified ({apiStatus.latencyMs}ms)
+              </span>
+            )}
+          </div>
+
+          <button
+            type="button"
+            onClick={() => void onVerifyApi()}
+            disabled={verifyingApi}
+            className="inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 border border-slate-300 rounded cursor-pointer disabled:opacity-60 whitespace-nowrap"
+          >
+            {verifyingApi ? (
+              <Loader2 className="w-3 h-3 animate-spin" />
+            ) : (
+              <RefreshCw className="w-3 h-3" />
+            )}
+            <span>{verifyingApi ? 'Testing...' : 'Verify API'}</span>
+          </button>
+        </div>
       </div>
 
       {/* Batch Progress & Summary Panel */}
@@ -502,20 +590,36 @@ export const StageMemoTab: React.FC<StageMemoTabProps> = ({
               )}
               <span>
                 {isThisDocBatchRunning
-                  ? `Scrutinizing and filling ${stageBatchScrutiny.completedSections.length} of ${stageBatchScrutiny.total} ${meta.title} sections...`
-                  : `${meta.title} AI scrutiny finished: ${stageBatchScrutiny.completedSections.length} of ${stageBatchScrutiny.total} sections populated.`}
+                  ? `Scrutinizing and filling ${stageBatchScrutiny.completedSections.length} of ${stageBatchScrutiny.total} ${meta.title} sections${elapsedSec > 0 ? ` (${elapsedSec}s)` : ''}...`
+                  : stageBatchScrutiny.statusMessage
+                    ? stageBatchScrutiny.statusMessage
+                    : `${meta.title} AI scrutiny finished: ${stageBatchScrutiny.completedSections.length} of ${stageBatchScrutiny.total} sections populated.`}
               </span>
             </div>
-            {!isThisDocBatchRunning && (
+            {isThisDocBatchRunning ? (
+              <button
+                type="button"
+                onClick={onCancelStageBatchScrutiny}
+                className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-semibold text-red-800 bg-white hover:bg-red-50 border border-red-300 rounded cursor-pointer whitespace-nowrap shrink-0"
+              >
+                <Square className="w-3 h-3 fill-current" />
+                <span>Stop</span>
+              </button>
+            ) : (
               <button
                 type="button"
                 onClick={onDismissStageBatchSummary}
-                className="text-slate-600 hover:text-slate-900 underline cursor-pointer"
+                aria-label="Dismiss stage batch summary"
+                className="p-1 text-slate-500 hover:text-slate-800 rounded cursor-pointer"
               >
-                Dismiss
+                <X className="w-3.5 h-3.5" />
               </button>
             )}
           </div>
+
+          {isThisDocBatchRunning && stageBatchScrutiny.statusMessage && (
+            <p className="text-[11px] text-emerald-900/90">{stageBatchScrutiny.statusMessage}</p>
+          )}
 
           <div className="w-full h-1.5 bg-emerald-200/80 rounded-full overflow-hidden">
             <div
