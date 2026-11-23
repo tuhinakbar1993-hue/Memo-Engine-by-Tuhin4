@@ -57,8 +57,8 @@ function renderNarrativeParagraphs(
 function buildStageMetadataTable(
   rows: Array<{ label: string; value: string; boldValue?: boolean }>
 ): Array<Paragraph | Table> {
-  const metaWidth = 5600;
-  const metaCols = pctWidths([34, 5, 61], metaWidth);
+  const metaWidth = 7400;
+  const metaCols = pctWidths([42, 4, 54], metaWidth);
   return [
     new Table({
       width: { size: metaWidth, type: WidthType.DXA },

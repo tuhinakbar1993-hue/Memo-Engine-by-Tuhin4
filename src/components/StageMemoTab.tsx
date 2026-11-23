@@ -21,7 +21,6 @@ import {
   STAGE_SECTION_LABELS,
   STAGE_SECTIONS_BY_DOC,
 } from '../engines/icMemoEngine';
-import { renderTemplatePreviewBlocks } from '../exporters/docxTemplateEngine';
 import type {
   ApiStatusInfo,
   MemoDocType,
@@ -35,6 +34,7 @@ import type {
   StageSourceUploadState,
 } from '../types/memo';
 import { CarriedICMemoBody } from './CarriedICMemoBody';
+import { DocxTemplateLivePreview } from './DocxTemplateLivePreview';
 import { TemplateManagerPanel } from './TemplateManagerPanel';
 
 interface StageMemoTabProps {
@@ -1200,45 +1200,12 @@ export const StageMemoTab: React.FC<StageMemoTabProps> = ({
 
       {/* Live Document Preview (Uploaded Template OR Built-In Bank Sheet) */}
       {tpl ? (
-        <div className="bg-slate-200/70 p-4 sm:p-8 rounded-lg overflow-x-auto space-y-3">
-          <div className="max-w-[794px] mx-auto bg-emerald-50 border border-emerald-200 rounded-md px-4 py-2 text-xs text-emerald-950 flex items-center justify-between gap-2">
-            <span>
-              <span className="font-semibold">Active Uploaded Template:</span> {tpl.fileName} — all IC Memo data, stage numbers/dates, and AI sections above are synchronized while preserving original margins, fonts, and table geometry.
-            </span>
-          </div>
-          <div className="ic-memo-sheet max-w-[794px] mx-auto bg-white shadow-sm border border-slate-300 px-12 py-8 space-y-2.5 text-black text-[10pt]">
-            {renderTemplatePreviewBlocks(tpl, ic, stageMemo).map((block, idx) => {
-              if (block.type === 'paragraph') {
-                return (
-                  <p key={idx} className="whitespace-pre-line leading-snug">
-                    {block.text}
-                  </p>
-                );
-              }
-              return (
-                <table
-                  key={idx}
-                  className="w-full table-fixed border-collapse border border-black text-[9.5pt]"
-                >
-                  <tbody>
-                    {(block.rows || []).map((row, rIdx) => (
-                      <tr key={rIdx}>
-                        {row.map((cell, cIdx) => (
-                          <td
-                            key={cIdx}
-                            className="border border-black px-2 py-1 align-middle whitespace-pre-line"
-                          >
-                            {cell}
-                          </td>
-                        ))}
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              );
-            })}
-          </div>
-        </div>
+        <DocxTemplateLivePreview
+          template={tpl}
+          memo={ic}
+          docType={docType}
+          stageMemo={stageMemo}
+        />
       ) : (
         <div className="bg-slate-200/70 p-4 sm:p-8 rounded-lg overflow-x-auto">
           <div className="ic-memo-sheet max-w-[794px] mx-auto bg-white shadow-sm border border-slate-300 px-14 py-8 space-y-3 text-black">
